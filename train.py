@@ -92,6 +92,15 @@ class Hyperparameters:
     state_dim = int(os.environ.get("STATE_DIM", 64))
     inner_dim = int(os.environ.get("INNER_DIM", 128))
 
+    # tpg-specific (v11)
+    gumbel_tau = float(os.environ.get("GUMBEL_TAU", 1.0))
+    halt_threshold = float(os.environ.get("HALT_THRESHOLD", 0.5))
+    ponder_lambda = float(os.environ.get("PONDER_LAMBDA", 0.01))
+
+    # sparse-register-specific (v12)
+    k_active = int(os.environ.get("K_ACTIVE", 256))
+    inner_mul = int(os.environ.get("INNER_MUL", 2))
+
     # Optimizer
     lr = float(os.environ.get("LR", 0.03))
     beta1 = float(os.environ.get("BETA1", 0.9))
@@ -114,6 +123,10 @@ CONTROL_TENSOR_NAME_PATTERNS = (
     "op_logits", "op_weights", "op_biases",
     # graph additions
     "q_scale", "k_scale", "diag", "prop_scale", "interact_scale",
+    # tpg additions
+    "halt_proj", "act_selector", "scale_gate", "t_scale",
+    # sparse register additions (v12)
+    "route_logits", "mem_scale", "mlp_scale",
 )
 
 # -----------------------------
@@ -740,6 +753,16 @@ def main():
             logit_softcap=args.logit_softcap,
             decay_init=args.decay_init,
         ).to(device).bfloat16()
+    elif args.model_version == "brainwave":
+        from v11_brainwave.model import BrainWaveGPT as BrainWaveGPTv11
+        base_model = BrainWaveGPTv11(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            gate_dim=args.state_dim,
+            logit_softcap=args.logit_softcap,
+        ).to(device).bfloat16()
     elif args.model_version == "meta":
         from v9_meta_state.model import MetaStateGPT
         base_model = MetaStateGPT(
@@ -750,6 +773,29 @@ def main():
             logit_softcap=args.logit_softcap,
             activation=args.activation,
             decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "sparse":
+        from v12_sparse_register.model import SparseRegisterGPT
+        base_model = SparseRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            k_active=args.k_active,
+            inner_mul=args.inner_mul,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "tpg":
+        from v11_tpg.model import TPGGPT
+        base_model = TPGGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            tau=args.gumbel_tau,
+            halt_threshold=args.halt_threshold,
+            ponder_lambda=args.ponder_lambda,
         ).to(device).bfloat16()
     else:
         base_model = AssocRegisterLM(

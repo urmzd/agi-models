@@ -1,16 +1,20 @@
 # TODO
 
-## Infrastructure
-- [ ] MLX support for current models (v3/v4/v5) — only v0 has an MLX training script
-- [ ] Single training script that detects PyTorch CUDA vs MLX and imports accordingly
+## Training runs needed
+- [ ] v11b (tpg) — neural TPG with hard routing, multi-timescale memory, adaptive depth
+- [ ] v11a (brainwave) — oscillatory primitives
+- [ ] v12 (sparse) — sparse register addressing
+- [ ] v10 (policy) — state-dependent policy execution
+- [ ] v7 (lgp) — differentiable register machine
+- [ ] v8 (graph) — word interaction graph
 
-## Architectures
-- [ ] v6 brain wave — implement oscillatory dynamics model
-- [ ] True LGP — evolve discrete instruction sequences, not just gradient descent
-- [ ] Word interaction graph — sparse learned word-to-word interaction matrix
+## Infrastructure
+- [ ] MLX support for current models — only v0 has an MLX training script
+- [ ] Wandb/tensorboard logging
+- [ ] Add tpg, brainwave, sparse to run_all.py model list
 
 ## Training
 - [x] Checkpoint save/resume
 - [x] Roundtrip eval optional (ROUNDTRIP_EVAL=1)
 - [ ] Learning rate warmup schedule (currently flat after warmup steps)
-- [ ] Wandb/tensorboard logging
+- [ ] Gumbel temperature annealing for v11b (tpg) — anneal tau from 1.0 → 0.1 during training
