@@ -2,9 +2,9 @@
 
 Experimental architectures exploring **interpretable, efficient computation** for language modeling — where the model's internal state is always human-readable.
 
-## Core Principle
+## Core Principles
 
-Standard transformers map tokens into opaque embedding spaces. These models keep computation in **vocabulary space** the entire time:
+**Registers are words.** Standard transformers map tokens into opaque embedding spaces. These models keep computation in **vocabulary space** the entire time:
 
 ```
 Input:  one-hot("cat") → R["cat"] = 1.0, all else 0.0
@@ -12,68 +12,87 @@ State:  always a distribution over words
 Output: register state IS the prediction — R["dog"]=0.3, R["mat"]=0.25
 ```
 
-No embedding matrix. No output projection. Every intermediate state is readable as "which words are active and how strongly." Interpretability by construction, not by post-hoc analysis.
+No embedding matrix. No output projection. Interpretability by construction.
+
+**Simple math only.** Dot products, outer products, dense projections, relu/gelu. If the math didn't exist before 1980, we don't use it. The power comes from composition and scale, not mathematical complexity.
+
+**Meta-learning over memorization.** The model's trained weights define *how to learn*. The runtime state (Q-table, associative memory) stores *what was learned* from the current sequence. The model learns during inference.
 
 ## Research Questions
 
-1. **Can we build competitive LMs without attention?** Using associative memory, convolutions, or FFT-based operations instead.
-2. **What is the minimum mathematical machinery needed?** All architectures here use math from the 1970s or earlier — dot products, outer products, Fourier transforms.
-3. **Can LGP-style register machines scale to language?** Sequential execution of cheap operations on a narrow register bank, inspired by [linear-gp](https://github.com/urmzd/linear-gp).
-4. **What happens when hidden_dim = vocab_size?** The model thinks in word-space, not in a learned latent space.
+1. **Can we replace attention with an evolving Q-table?** Cross-position mixing as meta-learning, not static projections.
+2. **What is the minimum computational substrate for language?** Sequential execution of cheap operations on a register bank.
+3. **Do Fourier projections help or hurt?** Early results: dense projections (full-rank) work, Fourier (rank-constrained) don't learn.
+4. **Can 101K params model language structure?** v4 reached val_bpb 3.65 — better than random but not competitive yet.
 
 ## Architecture Iterations
 
-| Version | Cross-position mixing | Within-position | Params | Best val_bpb | Status |
-|---------|----------------------|-----------------|--------|-------------|--------|
-| [v0](v0_register_lm/) | Shared attention | Fourier ops | 485K | — | Prototype (uses learned embeddings) |
+| Version | Cross-position | Within-position | Params | val_bpb | Status |
+|---------|---------------|-----------------|--------|---------|--------|
+| [v0](v0_register_lm/) | Shared attention | Fourier ops | 485K | — | Prototype |
 | [v1](v1_shared_attention/) | Shared attention | Fourier ops | 3.2M | **2.83** | Best so far |
-| [v2](v2_causal_conv/) | Depthwise causal conv | Fourier ops | 1.3M | — | Abandoned |
-| [v3](v3_assoc_memory/) | Associative memory | Fourier ops | 328K–1.7M | — | In progress |
-| [v4](v4_param_optimized/) | Assoc memory (shared Q/K) | Factored ops | ~101K | — | In progress |
-| [v5](v5_gauss_fft/) | FFT-based assoc memory | FFT register ops | 919K | — | Tested (flat loss) |
-| [v6](v6_brain_wave/) | Oscillatory coupling | Band-specific memory + alpha/theta-gamma gates | — | — | Ready |
-| [v7](v7_lgp/) | Causal decay memory | Learned program (op bank + soft addressing) | — | — | Ready |
-| [v8](v8_word_graph/) | Causal word propagation | Direct V×V word interaction graph | — | — | Ready |
+| [v2](v2_causal_conv/) | Depthwise conv | Fourier ops | 1.3M | — | Abandoned |
+| [v3](v3_assoc_memory/) | Assoc memory (Fourier proj) | Fourier ops | 328K–1.7M | ~3.9 | Fourier bottleneck |
+| [v4](v4_param_optimized/) | Assoc memory (shared Q/K) | Factored ops | 101K | **3.65** | Promising |
+| [v5](v5_gauss_fft/) | FFT-based assoc memory | FFT ops | 919K | ~4.1 | Flat loss |
+| [v6](v6_brain_wave/) | Oscillatory coupling | Band-specific ops | 824K | ~3.7 | Flat loss |
+| [v7](v7_lgp/) | Causal decay memory | Learned program (op bank) | — | — | Ready |
+| [v8](v8_word_graph/) | Word activation similarity | V×V interaction graph | — | — | Ready |
+| **[v9](v9_meta_state/)** | **Evolving Q-table (dense)** | **Dense MLP** | **~4.2M** | — | **Testing** |
+
+### Key finding
+
+Everything with Fourier projections (v3, v5, v6) fails to learn — the rank-32 bottleneck can't capture word relationships. Dense projections (v1, v4) work. **v9 combines dense projections with the Q-table meta-learning insight.**
 
 ## Quick Start
 
 ```bash
-# Download data
+# One-command setup on RunPod
+curl -sSL https://raw.githubusercontent.com/urmzd/agi-models/main/bootstrap.sh | bash
+
+# Or manually
 pip install huggingface_hub sentencepiece
 python data/download_data.py --variant sp1024
 
-# Train (single GPU)
-torchrun --standalone --nproc_per_node=1 train.py
+# Train v9 (meta-state Q-table)
+MODEL_VERSION=meta torchrun --standalone --nproc_per_node=1 train.py
 
-# Train a specific model version
-MODEL_VERSION=gauss torchrun --standalone --nproc_per_node=1 train.py
-MODEL_VERSION=v4 torchrun --standalone --nproc_per_node=1 train.py
+# All model versions
+MODEL_VERSION=v3    # associative memory
+MODEL_VERSION=v4    # param-optimized (101K params)
+MODEL_VERSION=gauss # FFT-based
+MODEL_VERSION=wave  # oscillatory dynamics
+MODEL_VERSION=lgp   # true LGP (differentiable register machine)
+MODEL_VERSION=graph # word interaction graph
+MODEL_VERSION=meta  # Q-table meta-state (recommended)
 ```
 
-All hyperparameters are configurable via environment variables. See [AGENTS.md](AGENTS.md).
+All hyperparameters configurable via env vars. See [AGENTS.md](AGENTS.md).
 
 ## Project Structure
 
 ```
 train.py                       # Unified training script (all models)
-model.py                       # Current model (v3 reference)
+model.py                       # v3 reference model
 model_v4.py                    # v4 param-optimized model
 data/download_data.py          # Data download (FineWeb sp1024)
-v0_register_lm/               # Original prototype
+bootstrap.sh                   # One-command RunPod setup
+v0_register_lm/               # Original prototype (learned embeddings)
 v1_shared_attention/           # Shared attention (best results)
 v2_causal_conv/                # Depthwise conv (abandoned)
-v3_assoc_memory/               # Associative memory
-v4_param_optimized/            # Param-optimized design
-v5_gauss_fft/                  # FFT-based design
+v3_assoc_memory/               # Associative memory (Fourier projections)
+v4_param_optimized/            # Param-optimized (101K params, shared Q/K)
+v5_gauss_fft/                  # FFT-based (Gauss)
 v6_brain_wave/                 # Oscillatory dynamics
-v7_lgp/                        # True LGP (differentiable register machine)
-v8_word_graph/                 # Direct word-to-word interaction graph
+v7_lgp/                        # True LGP (op bank + soft addressing)
+v8_word_graph/                 # Direct word-to-word graph
+v9_meta_state/                 # Q-table meta-state (dense, no Fourier)
 docs/                          # Research notes and design docs
 ```
 
 ## Inspirations
 
-- [Linear Genetic Programming](https://github.com/urmzd/linear-gp) — complex behavior from sequential execution of cheap operations on a narrow register bank
-- [OpenAI Parameter Golf](https://github.com/openai/parameter-golf) — training constraints that force architectural innovation
+- [Linear Genetic Programming](https://github.com/urmzd/linear-gp) — register machines, Q-tables, evolution of programs
+- [OpenAI Parameter Golf](https://github.com/openai/parameter-golf) — constraints that force innovation
 - Hopfield networks (1982) — associative memory via outer products
-- Gauss's FFT (1805) — frequency-domain computation predating modern ML by 220 years
+- Reinforcement learning — Q-tables as meta-learning substrate
