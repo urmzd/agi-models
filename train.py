@@ -1,6 +1,7 @@
 """
-RegisterGPT v2 — Attention-free register machine, PyTorch/CUDA training.
-Depthwise causal conv + Fourier register ops. No attention. No embedding.
+RegisterGPT v3 — Register machine with associative memory, PyTorch/CUDA training.
+Outer-product memory for cross-position mixing. Fourier ops for within-position transforms.
+No attention. No embedding. No output projection.
 Compatible with torchrun for multi-GPU training.
 """
 from __future__ import annotations
@@ -51,15 +52,15 @@ class Hyperparameters:
 
     # Model
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_steps = int(os.environ.get("NUM_STEPS", 16))
-    kernel_size = int(os.environ.get("KERNEL_SIZE", 16))
+    num_steps = int(os.environ.get("NUM_STEPS", 8))
     n_fourier_basis = int(os.environ.get("N_FOURIER_BASIS", 16))
     n_channels = int(os.environ.get("N_CHANNELS", 128))
     activation = os.environ.get("ACTIVATION", "gelu")
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    decay_init = float(os.environ.get("DECAY_INIT", 0.95))
 
-    # Optimizer (Adam only — no big matrices for Muon)
-    lr = float(os.environ.get("LR", 0.03))
+    # Optimizer
+    lr = float(os.environ.get("LR", 0.01))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.999))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -69,8 +70,9 @@ class Hyperparameters:
 
 # Patterns for control tensors (kept in float32)
 CONTROL_TENSOR_NAME_PATTERNS = (
-    "conv_scale", "op_scale", "read_coeffs", "write_coeffs",
-    "channel_mix", "bias", "out_scale", "logit_scale",
+    "mem_scale", "op_scale", "read_coeffs", "write_coeffs",
+    "channel_mix", "bias", "out_scale", "logit_scale", "decay",
+    "coeffs",
 )
 
 # -----------------------------
@@ -275,24 +277,64 @@ def apply_activation(x, activation):
     return F.gelu(x)
 
 
-class DepthwiseCausalConv1D(nn.Module):
-    """Causal depthwise conv — each word dim convolved independently over positions."""
-    def __init__(self, dim, kernel_size):
+class FourierProjection(nn.Module):
+    """Project vocab-space to channels via Fourier basis coefficients."""
+    def __init__(self, n_basis, n_channels, soft=False):
         super().__init__()
-        self.kernel_size = kernel_size
-        self.weight = nn.Parameter(torch.randn(dim, 1, kernel_size) * 0.02)
-        self.bias = nn.Parameter(torch.zeros(dim))
+        self.soft = soft
+        self.coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * 0.02)
 
-    def forward(self, x):
-        x = x.transpose(1, 2)  # (B, T, D) → (B, D, T)
-        x = F.pad(x, (self.kernel_size - 1, 0))
-        x = F.conv1d(x, self.weight.to(x.dtype), self.bias.to(x.dtype),
-                     groups=x.size(1))
-        return x.transpose(1, 2)
+    def forward(self, basis):
+        w = basis @ self.coeffs.T
+        if self.soft:
+            w = torch.softmax(w, dim=0)
+        return w
+
+
+class AssociativeMemoryStep(nn.Module):
+    """Cross-position mixing via running outer-product associative memory."""
+    def __init__(self, n_basis, n_channels, decay_init=0.95):
+        super().__init__()
+        self.n_channels = n_channels
+        self.query_proj = FourierProjection(n_basis, n_channels, soft=True)
+        self.key_proj = FourierProjection(n_basis, n_channels, soft=True)
+        self.value_proj = FourierProjection(n_basis, n_channels, soft=True)
+        self.output_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.decay = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        B, T, V = x.shape
+        C = self.n_channels
+        dtype = x.dtype
+
+        q_w = self.query_proj(basis).to(dtype)
+        k_w = self.key_proj(basis).to(dtype)
+        v_w = self.value_proj(basis).to(dtype)
+        o_w = self.output_proj(basis).to(dtype)
+
+        queries = x @ q_w
+        keys = x @ k_w
+        values = x @ v_w
+
+        decay = torch.sigmoid(self.decay)
+
+        # Sequential scan: running associative memory
+        M = torch.zeros(B, C, C, device=x.device, dtype=dtype)
+        outputs = []
+        for t in range(T):
+            retrieved = torch.bmm(queries[:, t:t+1, :], M).squeeze(1)
+            k_t = keys[:, t, :]
+            v_t = values[:, t, :]
+            M = decay * M + torch.bmm(k_t.unsqueeze(2), v_t.unsqueeze(1))
+            outputs.append(retrieved)
+
+        retrieved = torch.stack(outputs, dim=1)
+        return retrieved @ o_w.T * self.out_scale.to(dtype)
 
 
 class FourierRegisterOp(nn.Module):
-    """Vocabulary-space register operation."""
+    """Within-position register transform."""
     def __init__(self, n_basis, n_channels, activation="gelu"):
         super().__init__()
         self.activation = activation
@@ -313,25 +355,25 @@ class FourierRegisterOp(nn.Module):
 
 
 class RegisterStep(nn.Module):
-    """One LGP instruction: conv (cross-position) + Fourier op (within-position)."""
-    def __init__(self, dim, kernel_size, n_basis, n_channels, activation="gelu"):
+    """One LGP instruction: memory read/write + register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu", decay_init=0.95):
         super().__init__()
-        self.conv = DepthwiseCausalConv1D(dim, kernel_size)
+        self.memory = AssociativeMemoryStep(n_basis, n_channels, decay_init)
         self.register_op = FourierRegisterOp(n_basis, n_channels, activation)
-        self.conv_scale = nn.Parameter(torch.ones(dim))
-        self.op_scale = nn.Parameter(torch.ones(dim))
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, x, basis):
         D = x.size(-1)
-        x = x + self.conv_scale.to(x.dtype) * self.conv(F.rms_norm(x, (D,)))
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)), basis)
         x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)), basis)
         return x
 
 
-class ConvRegisterLM(nn.Module):
-    """Attention-free register machine. Each register IS a word."""
-    def __init__(self, vocab_size, num_steps, kernel_size, n_fourier_basis,
-                 n_channels, logit_softcap, activation="gelu"):
+class AssocRegisterLM(nn.Module):
+    """Register machine with associative memory. No attention. No embedding."""
+    def __init__(self, vocab_size, num_steps, n_fourier_basis, n_channels,
+                 logit_softcap, activation="gelu", decay_init=0.95):
         super().__init__()
         dim = vocab_size
         self.vocab_size = vocab_size
@@ -339,7 +381,7 @@ class ConvRegisterLM(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.steps = nn.ModuleList([
-            RegisterStep(dim, kernel_size, n_fourier_basis, n_channels, activation)
+            RegisterStep(n_fourier_basis, n_channels, activation, decay_init)
             for _ in range(num_steps)
         ])
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
@@ -420,14 +462,14 @@ def main():
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     bbl, hsl, ibl = build_sentencepiece_luts(sp, args.vocab_size, device)
 
-    base_model = ConvRegisterLM(
+    base_model = AssocRegisterLM(
         vocab_size=args.vocab_size,
         num_steps=args.num_steps,
-        kernel_size=args.kernel_size,
         n_fourier_basis=args.n_fourier_basis,
         n_channels=args.n_channels,
         logit_softcap=args.logit_softcap,
         activation=args.activation,
+        decay_init=args.decay_init,
     ).to(device).bfloat16()
 
     # Keep small control params in fp32
@@ -440,7 +482,6 @@ def main():
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
     model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
-    # Single Adam optimizer for everything
     optimizer = torch.optim.Adam(
         base_model.parameters(),
         lr=args.lr,
@@ -455,10 +496,10 @@ def main():
     n_params = sum(p.numel() for p in base_model.parameters())
     n_trainable = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
     log0(f"run_id:{args.run_id}")
-    log0(f"architecture:ConvRegisterLM (attention-free, registers ARE words)")
+    log0(f"architecture:AssocRegisterLM (associative memory, registers ARE words)")
     log0(f"model_params:{n_params} trainable:{n_trainable} vocab=dim={args.vocab_size}")
-    log0(f"steps:{args.num_steps} kernel:{args.kernel_size} channels:{args.n_channels} fourier:{args.n_fourier_basis}")
-    log0(f"activation:{args.activation} lr:{args.lr} grad_clip:{args.grad_clip_norm}")
+    log0(f"steps:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis}")
+    log0(f"activation:{args.activation} lr:{args.lr} grad_clip:{args.grad_clip_norm} decay_init:{args.decay_init}")
     log0(f"NO attention. NO embedding. NO output projection.")
     log0(f"world_size:{world_size} grad_accum:{grad_accum_steps} batch:{args.train_batch_tokens}")
 
@@ -553,7 +594,6 @@ def main():
         Path(qpath).write_bytes(compressed)
         log0(f"quantized:{qpath} bytes:{len(compressed)} ratio:{qstats['baseline_tensor_bytes'] / max(qstats['int8_payload_bytes'], 1):.2f}x")
 
-        # Roundtrip eval
         dq = dequantize_state_dict_int8(torch.load(io.BytesIO(zlib.decompress(Path(qpath).read_bytes())), weights_only=False))
         base_model.load_state_dict(dq, strict=False)
         qvl, qvbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)

@@ -1,9 +1,9 @@
 """
-RegisterGPT v2 — Attention-free register machine.
+RegisterGPT v3 — Register machine with associative memory.
 
-Replaces shared self-attention with per-step depthwise causal convolutions.
-Each step is a unique LGP instruction: cheap cross-position mixing (conv)
-followed by within-position register transforms (Fourier ops).
+Replaces attention with a running outer-product associative memory (1970s math).
+Each step: query the memory, transform, update the memory.
+Content-based dynamic routing without O(T²) attention.
 
   Input:  one-hot("cat") → R["cat"] = 1.0, everything else 0.0
   State:  always a distribution over words
@@ -12,12 +12,13 @@ followed by within-position register transforms (Fourier ops).
 Architecture:
   1. One-hot encoding over vocabulary (no learned embedding)
   2. N unique steps, each:
-     a. Depthwise causal conv  (cross-position: local context, O(T·d·k))
-     b. Fourier register op    (within-position: combine word activations)
+     a. Query associative memory   (content-based cross-position retrieval)
+     b. Fourier register op        (within-position: combine word activations)
+     c. Update associative memory  (store new associations)
   3. Register state → softcap → cross-entropy loss
 
 No attention. No embedding. No output projection.
-Many cheap unique steps instead of few expensive shared ones.
+Cross-position mixing via running associative memory (outer products).
 """
 
 import math
@@ -28,36 +29,7 @@ from torch import Tensor
 
 
 # ---------------------------------------------------------------------------
-# Depthwise causal convolution (replaces attention)
-# ---------------------------------------------------------------------------
-
-class DepthwiseCausalConv1D(nn.Module):
-    """Causal depthwise conv over sequence positions.
-
-    Each vocabulary dimension is convolved independently along the sequence.
-    This captures "how active was word j in the last k positions?"
-    Cross-word mixing is handled by the FourierRegisterOp.
-
-    For dim=1024, kernel_size=16: only 16K params (vs 3M for attention).
-    """
-
-    def __init__(self, dim: int, kernel_size: int):
-        super().__init__()
-        self.kernel_size = kernel_size
-        self.weight = nn.Parameter(torch.randn(dim, 1, kernel_size) * 0.02)
-        self.bias = nn.Parameter(torch.zeros(dim))
-
-    def forward(self, x: Tensor) -> Tensor:
-        # x: (B, T, D) → (B, D, T) for conv1d
-        x = x.transpose(1, 2)
-        x = F.pad(x, (self.kernel_size - 1, 0))  # causal: pad left only
-        x = F.conv1d(x, self.weight.to(x.dtype), self.bias.to(x.dtype),
-                     groups=x.size(1))
-        return x.transpose(1, 2)
-
-
-# ---------------------------------------------------------------------------
-# Fourier register operations
+# Fourier basis
 # ---------------------------------------------------------------------------
 
 def make_fourier_basis(dim: int, n_basis: int) -> Tensor:
@@ -71,13 +43,107 @@ def make_fourier_basis(dim: int, n_basis: int) -> Tensor:
     return basis
 
 
-class FourierRegisterOp(nn.Module):
-    """One LGP instruction operating on the vocabulary register bank.
+# ---------------------------------------------------------------------------
+# Fourier projection (cheap learned linear map via Fourier basis)
+# ---------------------------------------------------------------------------
 
-    Read:  gather word activations via Fourier-weighted patterns
-    Mix:   channel transform + nonlinearity
-    Write: scatter result back to vocabulary registers
+class FourierProjection(nn.Module):
+    """Project from vocab-space to a small channel space via Fourier basis.
+
+    Instead of a full (vocab, channels) matrix (~131K params for 1024×128),
+    parameterize through Fourier coefficients: (channels, 2*n_basis) (~8K params).
     """
+
+    def __init__(self, n_basis: int, n_channels: int, soft: bool = False):
+        super().__init__()
+        self.soft = soft
+        self.coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * 0.02)
+
+    def forward(self, basis: Tensor) -> Tensor:
+        # basis: (V, 2*n_basis), coeffs: (C, 2*n_basis)
+        # output: (V, C)
+        w = basis @ self.coeffs.T
+        if self.soft:
+            w = torch.softmax(w, dim=0)
+        return w
+
+
+# ---------------------------------------------------------------------------
+# Associative memory (outer product, 1970s Hopfield-style)
+# ---------------------------------------------------------------------------
+
+class AssociativeMemoryStep(nn.Module):
+    """One step of reading from and writing to a running associative memory.
+
+    Memory M ∈ R^(C×C) accumulates key⊗value outer products.
+    Query retrieves content-addressed information.
+    All via Fourier-parameterized projections (cheap).
+
+    This is the cross-position mixing mechanism — replaces attention.
+    """
+
+    def __init__(self, n_basis: int, n_channels: int, decay_init: float = 0.95):
+        super().__init__()
+        self.n_channels = n_channels
+
+        # Fourier projections: vocab → channels
+        self.query_proj = FourierProjection(n_basis, n_channels, soft=True)
+        self.key_proj = FourierProjection(n_basis, n_channels, soft=True)
+        self.value_proj = FourierProjection(n_basis, n_channels, soft=True)
+        self.output_proj = FourierProjection(n_basis, n_channels, soft=False)
+
+        # Memory decay — how quickly old associations fade
+        self.decay = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x: Tensor, basis: Tensor) -> Tensor:
+        """
+        x: (B, T, V) — register states
+        basis: (V, 2*n_basis) — Fourier basis
+        returns: (B, T, V) — retrieved information mapped back to vocab space
+        """
+        B, T, V = x.shape
+        C = self.n_channels
+        dtype = x.dtype
+
+        # Project vocab → channels via Fourier
+        q_w = self.query_proj(basis).to(dtype)   # (V, C)
+        k_w = self.key_proj(basis).to(dtype)     # (V, C)
+        v_w = self.value_proj(basis).to(dtype)   # (V, C)
+        o_w = self.output_proj(basis).to(dtype)  # (V, C)
+
+        queries = x @ q_w       # (B, T, C)
+        keys = x @ k_w          # (B, T, C)
+        values = x @ v_w        # (B, T, C)
+
+        decay = torch.sigmoid(self.decay)
+
+        # Scan: maintain running memory, query at each position
+        M = torch.zeros(B, C, C, device=x.device, dtype=dtype)
+        outputs = []
+        for t in range(T):
+            # Retrieve: content-based lookup
+            retrieved = torch.bmm(queries[:, t:t+1, :], M).squeeze(1)  # (B, C)
+
+            # Update memory: store new association
+            k_t = keys[:, t, :]    # (B, C)
+            v_t = values[:, t, :]  # (B, C)
+            M = decay * M + torch.bmm(k_t.unsqueeze(2), v_t.unsqueeze(1))  # (B, C, C)
+
+            outputs.append(retrieved)
+
+        retrieved = torch.stack(outputs, dim=1)  # (B, T, C)
+
+        # Map back to vocab space
+        return retrieved @ o_w.T * self.out_scale.to(dtype)
+
+
+# ---------------------------------------------------------------------------
+# Fourier register operation (within-position transform)
+# ---------------------------------------------------------------------------
+
+class FourierRegisterOp(nn.Module):
+    """Within-position register transform via Fourier basis."""
 
     def __init__(self, n_basis: int, n_channels: int, activation: str = "gelu"):
         super().__init__()
@@ -104,45 +170,45 @@ class FourierRegisterOp(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Register step (one LGP instruction)
+# Register step
 # ---------------------------------------------------------------------------
 
 class RegisterStep(nn.Module):
-    """One complete instruction: cross-position conv + within-position transform."""
+    """One LGP instruction: memory query + register transform + memory update."""
 
-    def __init__(self, dim: int, kernel_size: int, n_basis: int,
-                 n_channels: int, activation: str = "gelu"):
+    def __init__(self, n_basis: int, n_channels: int, activation: str = "gelu",
+                 decay_init: float = 0.95):
         super().__init__()
-        self.conv = DepthwiseCausalConv1D(dim, kernel_size)
+        self.memory = AssociativeMemoryStep(n_basis, n_channels, decay_init)
         self.register_op = FourierRegisterOp(n_basis, n_channels, activation)
-        self.conv_scale = nn.Parameter(torch.ones(dim))
-        self.op_scale = nn.Parameter(torch.ones(dim))
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, x: Tensor, basis: Tensor) -> Tensor:
         D = x.size(-1)
-        x = x + self.conv_scale.to(x.dtype) * self.conv(F.rms_norm(x, (D,)))
+        x = x + self.mem_scale.to(x.dtype) * self.memory(
+            F.rms_norm(x, (D,)), basis)
         x = x + self.op_scale.to(x.dtype) * self.register_op(
             F.rms_norm(x, (D,)), basis)
         return x
 
 
 # ---------------------------------------------------------------------------
-# RegisterGPT v2
+# RegisterGPT v3
 # ---------------------------------------------------------------------------
 
 class RegisterGPT(nn.Module):
-    """Attention-free language model where registers ARE words.
+    """Register machine with associative memory.
 
-    No embedding matrix — input is one-hot.
-    No output projection — register state is the prediction.
-    No attention — depthwise causal convolutions for cross-position mixing.
-    Many cheap unique steps instead of few expensive shared ones.
+    No embedding. No output projection. No attention.
+    Cross-position mixing via running outer-product memory.
+    Within-position transforms via Fourier register ops.
     """
 
-    def __init__(self, vocab_size: int = 1024, num_steps: int = 48,
-                 kernel_size: int = 16, n_fourier_basis: int = 16,
-                 n_channels: int = 64, logit_softcap: float = 30.0,
-                 activation: str = "gelu"):
+    def __init__(self, vocab_size: int = 1024, num_steps: int = 8,
+                 n_fourier_basis: int = 16, n_channels: int = 128,
+                 logit_softcap: float = 30.0, activation: str = "gelu",
+                 decay_init: float = 0.95):
         super().__init__()
         dim = vocab_size
         self.vocab_size = vocab_size
@@ -150,7 +216,7 @@ class RegisterGPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.steps = nn.ModuleList([
-            RegisterStep(dim, kernel_size, n_fourier_basis, n_channels, activation)
+            RegisterStep(n_fourier_basis, n_channels, activation, decay_init)
             for _ in range(num_steps)
         ])
 
