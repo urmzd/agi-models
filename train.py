@@ -453,7 +453,7 @@ class GaussSynthesis(nn.Module):
     def forward(self, h):
         n, V = self.n_freq, self.vocab_size
         Y_ri = h.float() @ self.weight
-        Y = torch.complex(Y_ri[..., :n], Y_ri[..., n:])
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
         shape = list(h.shape[:-1]) + [V // 2 + 1]
         full = torch.zeros(shape, dtype=Y.dtype, device=h.device)
         full[..., 1:n + 1] = Y
@@ -512,7 +512,7 @@ class GaussRegisterOp(nn.Module):
         h = h @ self.channel_mix + self.bias
         h = apply_activation(h, self.activation)
         Y_ri = h @ self.ch_to_freq.T
-        Y = torch.complex(Y_ri[..., :n], Y_ri[..., n:])
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
         full = torch.zeros(B, T, V // 2 + 1, dtype=Y.dtype, device=x.device)
         full[..., 1:n + 1] = Y
         return torch.fft.irfft(full, n=V, dim=-1).to(dtype) * self.out_scale.to(dtype)
