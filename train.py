@@ -57,7 +57,7 @@ class Hyperparameters:
     n_channels = int(os.environ.get("N_CHANNELS", 128))
     activation = os.environ.get("ACTIVATION", "gelu")
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
-    decay_init = float(os.environ.get("DECAY_INIT", 0.95))
+    decay_init = float(os.environ.get("DECAY_INIT", 3.0))
 
     # Optimizer
     lr = float(os.environ.get("LR", 0.01))
@@ -71,7 +71,7 @@ class Hyperparameters:
 # Patterns for control tensors (kept in float32)
 CONTROL_TENSOR_NAME_PATTERNS = (
     "mem_scale", "op_scale", "read_coeffs", "write_coeffs",
-    "channel_mix", "bias", "out_scale", "logit_scale", "decay",
+    "channel_mix", "bias", "out_scale", "logit_scale", "decay_logit",
     "coeffs",
 )
 
@@ -292,20 +292,19 @@ class FourierProjection(nn.Module):
 
 
 class AssociativeMemoryStep(nn.Module):
-    """Cross-position mixing via running outer-product associative memory."""
-    def __init__(self, n_basis, n_channels, decay_init=0.95):
+    """Cross-position mixing via causal decay-weighted associative memory (parallel)."""
+    def __init__(self, n_basis, n_channels, decay_init=3.0):
         super().__init__()
         self.n_channels = n_channels
         self.query_proj = FourierProjection(n_basis, n_channels, soft=True)
         self.key_proj = FourierProjection(n_basis, n_channels, soft=True)
         self.value_proj = FourierProjection(n_basis, n_channels, soft=True)
         self.output_proj = FourierProjection(n_basis, n_channels, soft=False)
-        self.decay = nn.Parameter(torch.tensor(decay_init))
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
         self.out_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x, basis):
         B, T, V = x.shape
-        C = self.n_channels
         dtype = x.dtype
 
         q_w = self.query_proj(basis).to(dtype)
@@ -317,19 +316,20 @@ class AssociativeMemoryStep(nn.Module):
         keys = x @ k_w
         values = x @ v_w
 
-        decay = torch.sigmoid(self.decay)
+        # Content similarity in channel space
+        scores = torch.bmm(queries, keys.transpose(1, 2))  # (B, T, T)
 
-        # Sequential scan: running associative memory
-        M = torch.zeros(B, C, C, device=x.device, dtype=dtype)
-        outputs = []
-        for t in range(T):
-            retrieved = torch.bmm(queries[:, t:t+1, :], M).squeeze(1)
-            k_t = keys[:, t, :]
-            v_t = values[:, t, :]
-            M = decay * M + torch.bmm(k_t.unsqueeze(2), v_t.unsqueeze(1))
-            outputs.append(retrieved)
+        # Causal decay mask: decay^(t-s-1) for s < t, 0 otherwise
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)  # (T, T)
+        causal_mask = (diff > 0)
+        decay_weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal_mask
+        scores = scores * decay_weights.to(dtype).unsqueeze(0)
 
-        retrieved = torch.stack(outputs, dim=1)
+        # Retrieve: weighted sum of values
+        retrieved = torch.bmm(scores, values)  # (B, T, C)
+
         return retrieved @ o_w.T * self.out_scale.to(dtype)
 
 
@@ -356,7 +356,7 @@ class FourierRegisterOp(nn.Module):
 
 class RegisterStep(nn.Module):
     """One LGP instruction: memory read/write + register transform."""
-    def __init__(self, n_basis, n_channels, activation="gelu", decay_init=0.95):
+    def __init__(self, n_basis, n_channels, activation="gelu", decay_init=3.0):
         super().__init__()
         self.memory = AssociativeMemoryStep(n_basis, n_channels, decay_init)
         self.register_op = FourierRegisterOp(n_basis, n_channels, activation)

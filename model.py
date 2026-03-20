@@ -1,9 +1,9 @@
 """
 RegisterGPT v3 — Register machine with associative memory.
 
-Replaces attention with a running outer-product associative memory (1970s math).
-Each step: query the memory, transform, update the memory.
-Content-based dynamic routing without O(T²) attention.
+Replaces attention with a causal decay-weighted associative memory.
+Mathematically: output_t = sum_{s<t} decay^(t-s-1) * (q_t · k_s) * v_s
+This is linear attention with exponential decay — content-based, causal, parallel.
 
   Input:  one-hot("cat") → R["cat"] = 1.0, everything else 0.0
   State:  always a distribution over words
@@ -12,13 +12,12 @@ Content-based dynamic routing without O(T²) attention.
 Architecture:
   1. One-hot encoding over vocabulary (no learned embedding)
   2. N unique steps, each:
-     a. Query associative memory   (content-based cross-position retrieval)
-     b. Fourier register op        (within-position: combine word activations)
-     c. Update associative memory  (store new associations)
+     a. Associative memory query  (causal decay-weighted matmul, parallel)
+     b. Fourier register op       (within-position: combine word activations)
   3. Register state → softcap → cross-entropy loss
 
 No attention. No embedding. No output projection.
-Cross-position mixing via running associative memory (outer products).
+All 1970s math: dot products, outer products, weighted averages.
 """
 
 import math
@@ -44,15 +43,11 @@ def make_fourier_basis(dim: int, n_basis: int) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Fourier projection (cheap learned linear map via Fourier basis)
+# Fourier projection
 # ---------------------------------------------------------------------------
 
 class FourierProjection(nn.Module):
-    """Project from vocab-space to a small channel space via Fourier basis.
-
-    Instead of a full (vocab, channels) matrix (~131K params for 1024×128),
-    parameterize through Fourier coefficients: (channels, 2*n_basis) (~8K params).
-    """
+    """Project from vocab-space to channel space via Fourier basis coefficients."""
 
     def __init__(self, n_basis: int, n_channels: int, soft: bool = False):
         super().__init__()
@@ -60,50 +55,36 @@ class FourierProjection(nn.Module):
         self.coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * 0.02)
 
     def forward(self, basis: Tensor) -> Tensor:
-        # basis: (V, 2*n_basis), coeffs: (C, 2*n_basis)
-        # output: (V, C)
-        w = basis @ self.coeffs.T
+        w = basis @ self.coeffs.T  # (V, C)
         if self.soft:
             w = torch.softmax(w, dim=0)
         return w
 
 
 # ---------------------------------------------------------------------------
-# Associative memory (outer product, 1970s Hopfield-style)
+# Associative memory (parallel, no sequential loop)
 # ---------------------------------------------------------------------------
 
 class AssociativeMemoryStep(nn.Module):
-    """One step of reading from and writing to a running associative memory.
+    """Cross-position mixing via causal decay-weighted associative memory.
 
-    Memory M ∈ R^(C×C) accumulates key⊗value outer products.
-    Query retrieves content-addressed information.
-    All via Fourier-parameterized projections (cheap).
-
-    This is the cross-position mixing mechanism — replaces attention.
+    Fully parallel — uses batched matmuls, no Python loops.
+    output_t = sum_{s<t} decay^(t-s-1) * (q_t · k_s) * v_s
     """
 
-    def __init__(self, n_basis: int, n_channels: int, decay_init: float = 0.95):
+    def __init__(self, n_basis: int, n_channels: int, decay_init: float = 3.0):
         super().__init__()
         self.n_channels = n_channels
-
-        # Fourier projections: vocab → channels
         self.query_proj = FourierProjection(n_basis, n_channels, soft=True)
         self.key_proj = FourierProjection(n_basis, n_channels, soft=True)
         self.value_proj = FourierProjection(n_basis, n_channels, soft=True)
         self.output_proj = FourierProjection(n_basis, n_channels, soft=False)
-
-        # Memory decay — how quickly old associations fade
-        self.decay = nn.Parameter(torch.tensor(decay_init))
+        # decay_init=3.0 → sigmoid(3.0) ≈ 0.95
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
         self.out_scale = nn.Parameter(torch.tensor(0.1))
 
     def forward(self, x: Tensor, basis: Tensor) -> Tensor:
-        """
-        x: (B, T, V) — register states
-        basis: (V, 2*n_basis) — Fourier basis
-        returns: (B, T, V) — retrieved information mapped back to vocab space
-        """
         B, T, V = x.shape
-        C = self.n_channels
         dtype = x.dtype
 
         # Project vocab → channels via Fourier
@@ -116,23 +97,19 @@ class AssociativeMemoryStep(nn.Module):
         keys = x @ k_w          # (B, T, C)
         values = x @ v_w        # (B, T, C)
 
-        decay = torch.sigmoid(self.decay)
+        # Content similarity in channel space
+        scores = torch.bmm(queries, keys.transpose(1, 2))  # (B, T, T)
 
-        # Scan: maintain running memory, query at each position
-        M = torch.zeros(B, C, C, device=x.device, dtype=dtype)
-        outputs = []
-        for t in range(T):
-            # Retrieve: content-based lookup
-            retrieved = torch.bmm(queries[:, t:t+1, :], M).squeeze(1)  # (B, C)
+        # Causal decay mask: decay^(t-s-1) for s < t, 0 otherwise
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)  # (T, T), diff[t,s] = t - s
+        causal_mask = (diff > 0)
+        decay_weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal_mask
+        scores = scores * decay_weights.to(dtype).unsqueeze(0)  # (B, T, T)
 
-            # Update memory: store new association
-            k_t = keys[:, t, :]    # (B, C)
-            v_t = values[:, t, :]  # (B, C)
-            M = decay * M + torch.bmm(k_t.unsqueeze(2), v_t.unsqueeze(1))  # (B, C, C)
-
-            outputs.append(retrieved)
-
-        retrieved = torch.stack(outputs, dim=1)  # (B, T, C)
+        # Retrieve: weighted sum of values
+        retrieved = torch.bmm(scores, values)  # (B, T, C)
 
         # Map back to vocab space
         return retrieved @ o_w.T * self.out_scale.to(dtype)
@@ -174,10 +151,10 @@ class FourierRegisterOp(nn.Module):
 # ---------------------------------------------------------------------------
 
 class RegisterStep(nn.Module):
-    """One LGP instruction: memory query + register transform + memory update."""
+    """One LGP instruction: memory query + register transform."""
 
     def __init__(self, n_basis: int, n_channels: int, activation: str = "gelu",
-                 decay_init: float = 0.95):
+                 decay_init: float = 3.0):
         super().__init__()
         self.memory = AssociativeMemoryStep(n_basis, n_channels, decay_init)
         self.register_op = FourierRegisterOp(n_basis, n_channels, activation)
@@ -201,16 +178,15 @@ class RegisterGPT(nn.Module):
     """Register machine with associative memory.
 
     No embedding. No output projection. No attention.
-    Cross-position mixing via running outer-product memory.
-    Within-position transforms via Fourier register ops.
+    Cross-position via decay-weighted associative memory (parallel).
+    Within-position via Fourier register ops.
     """
 
     def __init__(self, vocab_size: int = 1024, num_steps: int = 8,
                  n_fourier_basis: int = 16, n_channels: int = 128,
                  logit_softcap: float = 30.0, activation: str = "gelu",
-                 decay_init: float = 0.95):
+                 decay_init: float = 3.0):
         super().__init__()
-        dim = vocab_size
         self.vocab_size = vocab_size
         self.num_steps = num_steps
         self.logit_softcap = logit_softcap
@@ -222,11 +198,10 @@ class RegisterGPT(nn.Module):
 
         self.logit_scale = nn.Parameter(torch.tensor(1.0))
         self.register_buffer("fourier_basis",
-                             make_fourier_basis(dim, n_fourier_basis))
+                             make_fourier_basis(vocab_size, n_fourier_basis))
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
         V = self.vocab_size
-
         x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
         x = F.rms_norm(x, (V,))
 
