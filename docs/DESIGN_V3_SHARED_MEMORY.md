@@ -108,3 +108,14 @@ The current v3 codebase (`model.py`) already implements the two-phase structure:
 The outer-product memory in the current implementation is a specific instance of the flat key-value store option, where keys and values are projected from vocabulary space through Fourier coefficients, and the memory matrix M accumulates key-value outer products with exponential decay.
 
 The design options above generalize this to support alternative memory structures (positional slots, stacks, multi-head composites) and to make the program structure more explicit and inspectable.
+
+## Relationship to v4 Implementation
+
+RegisterGPT v4 (`model_v4.py`) applies parameter-golf optimizations to the v3 architecture, reducing ~329K params to ~101K while preserving the two-phase structure:
+
+- **Shared Q/K projections**: All steps share a single query and key definition ("what is similar"), while keeping V/O unique per step ("what to retrieve" and "how to output"). This reflects the observation that similarity metrics are global while retrieval strategies are local.
+- **Multi-head decay (H=4)**: Each head maintains a different temporal decay rate, allowing simultaneous capture of fast (bigram) and slow (clause-level) dependencies within the associative memory.
+- **Factored channel_mix**: The dense 128x128 matrix in FourierRegisterOp is replaced with diagonal + rank-8, exploiting the fact that the Fourier read already constrains input rank.
+- **Step reuse with per-invocation overrides**: 5 unique step definitions are each invoked twice (10 total depth), with per-invocation scalar overrides for decay, mem_scale, op_scale, and out_scale providing cheap depth specialization.
+
+These optimizations preserve the shared memory bank model: the associative memory still mediates all cross-position communication, and the register ops still perform local computation. The v4 changes are purely about parameter efficiency, not architectural philosophy.
