@@ -1,0 +1,20 @@
+[project]
+name = "registergpt"
+version = "0.1.0"
+description = "A language model where each register is a word"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy",
+    "sentencepiece",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "torch>=2.4",
+]
+mlx = [
+    "mlx>=0.16",
+]
+
+[tool.uv]
+default-groups = []
