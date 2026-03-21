@@ -59,7 +59,7 @@ class Hyperparameters:
     mlx_eager_eval: bool = bool(int(os.environ.get("MLX_EAGER_EVAL", "1")))
     warmup_steps: int = int(os.environ.get("WARMUP_STEPS", 20))
     warmdown_iters: int = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    max_wallclock_seconds: float = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    max_wallclock_seconds = float(os.environ["MAX_WALLCLOCK_SECONDS"]) if "MAX_WALLCLOCK_SECONDS" in os.environ else None
 
     # Model: dim = vocab_size (registers ARE words)
     vocab_size: int = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -106,7 +106,7 @@ class Hyperparameters:
     def lr_mul(self, step: int, elapsed_ms: float) -> float:
         if self.warmdown_iters <= 0:
             return 1.0
-        if self.max_wallclock_seconds <= 0:
+        if not self.max_wallclock_seconds:
             warmdown_start = max(self.iterations - self.warmdown_iters, 0)
             return max((self.iterations - step) / max(self.warmdown_iters, 1), 0.0) if warmdown_start <= step < self.iterations else 1.0
         step_ms = elapsed_ms / max(step, 1)
@@ -806,7 +806,7 @@ def main() -> None:
 
     # Training loop
     train_time_ms = 0.0
-    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds else None
     stop_after_step = None
     t0 = time.perf_counter()
     step = 0

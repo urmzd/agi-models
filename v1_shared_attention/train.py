@@ -47,7 +47,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
-    max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    max_wallclock_seconds = float(os.environ["MAX_WALLCLOCK_SECONDS"]) if "MAX_WALLCLOCK_SECONDS" in os.environ else None
 
     # Model: dim = vocab_size (registers ARE words)
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -590,7 +590,7 @@ def main():
         for o in optimizers:
             o.zero_grad(set_to_none=True)
 
-    max_wc_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    max_wc_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds else None
 
     def lr_mul(step, elapsed_ms):
         if args.warmdown_iters <= 0:
