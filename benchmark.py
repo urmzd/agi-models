@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import torch
 
-from core.registry import REGISTRY, build_model
+from core.registry import get_registry, build_model
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +160,7 @@ def main():
         gumbel_tau=1.0, halt_threshold=0.5, ponder_lambda=0.01,
     )
 
-    registry = {name: (lambda n=name: build_model(n, model_args)) for name in REGISTRY}
+    registry = {name: (lambda n=name: build_model(n, model_args)) for name in get_registry()}
 
     selected = args.models if args.models else list(registry.keys())
     unknown = [m for m in selected if m not in registry]

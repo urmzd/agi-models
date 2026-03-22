@@ -27,7 +27,7 @@ from core.quantize import (
     dequantize_state_dict_int8,
     quantize_state_dict_int8,
 )
-from core.registry import build_model
+from core.registry import get_registry, build_model
 
 
 def main():
@@ -126,19 +126,13 @@ def main():
     raw_bytes = sum(p.numel() * p.element_size() for p in base_model.parameters())
     est_int8_bytes = sum(p.numel() for p in base_model.parameters())  # ~1 byte per param
     log0(f"run_id:{args.run_id}")
+    model_cls = get_registry()[args.model_version]
     log0(f"model_version:{args.model_version}")
     log0(f"model_params:{n_params} trainable:{n_trainable} vocab=dim={args.vocab_size} raw:{raw_bytes/1e6:.1f}MB est_int8:{est_int8_bytes/1e6:.1f}MB")
-    if args.model_version == "wave":
-        log0(f"architecture:BrainWaveGPT (oscillatory dynamics, cross-frequency coupling)")
-        log0(f"cycles:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis} bands:{args.band_split}")
-        log0(f"slow_decay_init:{args.slow_decay_init} fast_decay_init:{args.fast_decay_init}")
-    elif args.model_version == "v4":
-        log0(f"unique_steps:{args.unique_steps} invocations:{args.invocations_per_step} depth:{args.unique_steps * args.invocations_per_step}")
-        log0(f"channels:{args.n_channels} heads:{args.n_heads} rank:{args.transform_rank} fourier:{args.n_fourier_basis}")
-    else:
-        log0(f"steps:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis}")
+    log0(f"architecture:{model_cls.architecture}")
+    log0(f"cross_position:{model_cls.cross_position} within_position:{model_cls.within_position}")
+    log0(f"config:{model_cls.build_kwargs(args)}")
     log0(f"activation:{args.activation} lr:{args.lr} grad_clip:{args.grad_clip_norm} decay_init:{args.decay_init}")
-    log0(f"NO attention. NO embedding. NO output projection.")
     log0(f"world_size:{world_size} grad_accum:{grad_accum_steps} batch:{args.train_batch_tokens}")
 
     log0(f"[init] loading training data from {args.train_files}")

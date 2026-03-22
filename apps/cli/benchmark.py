@@ -15,7 +15,13 @@ import sys
 from pathlib import Path
 
 
-ALL_VERSIONS = [
+def _get_all_versions():
+    """Auto-discover available model versions."""
+    from core.registry import get_registry
+    return sorted(get_registry().keys())
+
+
+ALL_VERSIONS = [  # fallback ordering; overridden at runtime if models importable
     "v1_attention", "v2_conv", "v3_assoc", "v4_golf",
     "v5_gauss", "v6_wave", "v7_lgp", "v8_graph",
     "v9_meta", "v10_policy", "v11_brainwave", "v11_tpg",
@@ -133,7 +139,11 @@ def main():
                         help="Output JSON path (default: logs/benchmark_results.json)")
     args = parser.parse_args()
 
-    versions = args.versions.split(",") if args.versions else ALL_VERSIONS
+    try:
+        all_versions = _get_all_versions()
+    except Exception:
+        all_versions = ALL_VERSIONS
+    versions = args.versions.split(",") if args.versions else all_versions
     nproc = detect_gpus()
 
     print(f"Benchmarking {len(versions)} models: {', '.join(versions)}")
