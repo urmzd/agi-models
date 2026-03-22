@@ -1,0 +1,614 @@
+[01:29:17] """
+RegisterGPT — PyTorch/CUDA training for all model versions.
+Compatible with torchrun for multi-GPU training.
+"""
+from __future__ import annotations
+
+import io
+import json
+import os
+import random
+import time
+import zlib
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+from core.config import Hyperparameters
+from core.data import DistributedTokenLoader, load_validation_tokens
+from core.eval import build_sentencepiece_luts, eval_val
+from core.quantize import (
+    CONTROL_TENSOR_NAME_PATTERNS,
+    dequantize_state_dict_int8,
+    quantize_state_dict_int8,
+)
+from core.registry import get_registry, build_model
+
+
+def main():
+    code = Path(__file__).read_text(encoding="utf-8")
+    args = Hyperparameters()
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    grad_accum_steps = args.grad_accum_steps
+    grad_scale = 1.0 / grad_accum_steps
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    master = rank == 0
+    if distributed:
+        os.environ["NCCL_P2P_DISABLE"] = args.nccl_p2p_disable
+        if master:
+            print(f"[init] NCCL_P2P_DISABLE={args.nccl_p2p_disable}, calling init_process_group")
+        dist.init_process_group(backend="nccl")
+        if master:
+            print("[init] init_process_group done, waiting on barrier")
+        dist.barrier()
+        if master:
+            print("[init] DDP barrier passed")
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    logfile = None
+    if master:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg, console=True):
+        if not master: return
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        if console: print(line)
+        if logfile:
+            with open(logfile, "a") as f: print(line, file=f)
+
+    log0(code, console=False)
+    log0(f"[config]\n{json.dumps(args.to_dict(), indent=2, default=str)}", console=False)
+    log0(f"[init] rank={rank} world_size={world_size} device={device} model_version={args.model_version}")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    log0(f"[init] loading tokenizer from {args.tokenizer_path}")
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    if int(sp.vocab_size()) != args.vocab_size:
+        raise ValueError(f"VOCAB_SIZE mismatch: tokenizer has {sp.vocab_size()}, expected {args.vocab_size}")
+    log0(f"[init] loading validation data from {args.val_files}")
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    bbl, hsl, ibl = build_sentencepiece_luts(sp, args.vocab_size, device)
+    log0(f"[init] data loaded: {val_tokens.numel()} val tokens")
+
+    base_model = build_model(args.model_version, args).to(device).bfloat16()
+
+    # Keep small control params in fp32
+    with torch.no_grad():
+        for name, p in base_model.named_parameters():
+            if (p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)) and p.dtype != torch.float32:
+                p.data = p.data.float()
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"[init] model built: {n_params/1e3:.0f}K params on {device}")
+
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.torch_compile else base_model
+    if distributed:
+        dist.barrier()
+    log0(f"[init] wrapping with DDP (distributed={distributed})")
+    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    log0(f"[init] DDP ready")
+
+    optimizer = torch.optim.Adam(
+        base_model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+    for g in optimizer.param_groups:
+        g["base_lr"] = args.lr
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    n_trainable = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    raw_bytes = sum(p.numel() * p.element_size() for p in base_model.parameters())
+    est_int8_bytes = sum(p.numel() for p in base_model.parameters())  # ~1 byte per param
+    log0(f"run_id:{args.run_id}")
+    model_cls = get_registry()[args.model_version]
+    log0(f"model_version:{args.model_version}")
+    log0(f"model_params:{n_params} trainable:{n_trainable} vocab=dim={args.vocab_size} raw:{raw_bytes/1e6:.1f}MB est_int8:{est_int8_bytes/1e6:.1f}MB")
+    log0(f"architecture:{model_cls.architecture}")
+    log0(f"cross_position:{model_cls.cross_position} within_position:{model_cls.within_position}")
+    log0(f"config:{model_cls.build_kwargs(args)}")
+    log0(f"activation:{args.activation} lr:{args.lr} grad_clip:{args.grad_clip_norm} decay_init:{args.decay_init}")
+    log0(f"world_size:{world_size} grad_accum:{grad_accum_steps} batch:{args.train_batch_tokens}")
+
+    log0(f"[init] loading training data from {args.train_files}")
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    max_wc_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds else None
+
+    def lr_mul(step, elapsed_ms):
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wc_ms is None:
+            ws = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if ws <= step < args.iterations else 1.0
+        sms = elapsed_ms / max(step, 1)
+        wms = args.warmdown_iters * sms
+        rms = max(max_wc_ms - elapsed_ms, 0.0)
+        return rms / max(wms, 1e-9) if rms <= wms else 1.0
+
+    # Resume from checkpoint if provided
+    start_step = 0
+    if args.resume_from and Path(args.resume_from).exists():
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        if "model" in ckpt and "step" in ckpt:
+            base_model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_step = ckpt["step"]
+            log0(f"resumed checkpoint from {args.resume_from} at step {start_step}")
+        else:
+            base_model.load_state_dict(ckpt, strict=False)
+            log0(f"loaded weights from {args.resume_from} (no optimizer/step, restarting from 0)")
+
+    def save_checkpoint(step):
+        if not master:
+            return
+        ckpt_path = f"logs/{args.run_id}_ckpt.pt"
+        torch.save({
+            "model": base_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+        }, ckpt_path)
+        log0(f"checkpoint:{ckpt_path} step:{step}")
+
+    # Warmup (skip if resuming)
+    log0(f"[init] starting warmup ({args.warmup_steps} steps)")
+    if start_step == 0:
+        for ws in range(args.warmup_steps):
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = model(x, y)
+                (loss * grad_scale).backward()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            optimizer.step()
+            torch.cuda.synchronize()
+            if master and (ws + 1) % 10 == 0 or ws + 1 == args.warmup_steps:
+                log0(f"warmup:{ws + 1}/{args.warmup_steps}")
+
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Training
+    train_ms = 0.0
+    stop_after = None
+    t0 = time.perf_counter()
+    step = start_step
+    while True:
+        last = step == args.iterations or (stop_after is not None and step >= stop_after)
+        if last or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            train_ms += 1000.0 * (time.perf_counter() - t0)
+            vl, vbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"step:{step}/{args.iterations} val_loss:{vl:.4f} val_bpb:{vbpb:.4f} train_time:{train_ms:.0f}ms")
+            t0 = time.perf_counter()
+        if last:
+            if stop_after is not None and step < args.iterations:
+                log0(f"stopping_early: step:{step}/{args.iterations}")
+            break
+
+        lm = lr_mul(step, train_ms + 1000.0 * (time.perf_counter() - t0))
+        for g in optimizer.param_groups:
+            g["lr"] = g["base_lr"] * lm
+
+        step_t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        train_loss_accum = 0.0
+        for _ in range(grad_accum_steps):
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+            (loss * grad_scale).backward()
+            train_loss_accum += loss.item() * grad_scale
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        approx_ms = train_ms + 1000.0 * (time.perf_counter() - t0)
+        step += 1
+        if master and args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0):
+            log0(f"step:{step}/{args.iterations} train_loss:{train_loss_accum:.4f} time:{approx_ms:.0f}ms avg:{approx_ms / step:.1f}ms tok/s:{args.train_batch_tokens / (step_ms / 1000):.0f}")
+        if max_wc_ms and stop_after is None and approx_ms >= max_wc_ms:
+            stop_after = step
+        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            save_checkpoint(step)
+
+    # Final checkpoint
+    save_checkpoint(step)
+
+    # Serialize
+    if master:
+        sd = {k: v for k, v in base_model.state_dict().items()}
+        out = f"logs/{args.run_id}_model.pt"
+        torch.save(sd, out)
+        log0(f"saved:{out} bytes:{Path(out).stat().st_size}")
+
+        qobj, qstats = quantize_state_dict_int8(sd)
+        buf = io.BytesIO()
+        torch.save(qobj, buf)
+        compressed = zlib.compress(buf.getvalue(), 9)
+        qpath = f"logs/{args.run_id}_model.int8.ptz"
+        Path(qpath).write_bytes(compressed)
+        log0(f"quantized:{qpath} bytes:{len(compressed)} ratio:{qstats['baseline_tensor_bytes'] / max(qstats['int8_payload_bytes'], 1):.2f}x")
+
+        if args.roundtrip_eval:
+            dq = dequantize_state_dict_int8(torch.load(io.BytesIO(zlib.decompress(Path(qpath).read_bytes())), weights_only=False))
+            base_model.load_state_dict(dq, strict=False)
+            qvl, qvbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"final_int8_zlib_roundtrip val_loss:{qvl:.4f} val_bpb:{qvbpb:.4f}")
+
+        # Write manifest
+        manifest = {
+            "run_id": args.run_id,
+            "model_version": args.model_version,
+            "params": n_params,
+            "trainable": n_trainable,
+            "raw_bytes": raw_bytes,
+            "est_int8_bytes": est_int8_bytes,
+            "quantized_bytes": len(compressed),
+            "vocab_size": args.vocab_size,
+            "num_steps": args.num_steps,
+            "n_channels": getattr(args, "n_channels", None),
+            "n_fourier_basis": getattr(args, "n_fourier_basis", None),
+            "state_dim": getattr(args, "state_dim", None),
+            "inner_dim": getattr(args, "inner_dim", None),
+            "n_ops": getattr(args, "n_ops", None),
+            "lr": args.lr,
+            "activation": args.activation,
+            "decay_init": args.decay_init,
+            "steps_trained": step,
+            "final_train_loss": train_loss_accum if step > start_step else None,
+            "val_loss": vl,
+            "val_bpb": vbpb,
+            "train_time_ms": train_ms,
+            "world_size": world_size,
+            "grad_accum_steps": grad_accum_steps,
+            "batch_tokens": args.train_batch_tokens,
+            "model_path": out,
+            "quantized_path": qpath,
+        }
+        manifest_path = f"logs/{args.run_id}_manifest.json"
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        log0(f"manifest:{manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+[01:29:17] [config]
+{
+  "DataConfig": {
+    "data_path": "./data/datasets/fineweb10B_sp1024",
+    "tokenizer_path": "./data/tokenizers/fineweb_1024_bpe.model",
+    "train_pattern": "",
+    "val_pattern": "",
+    "train_files": "./data/datasets/fineweb10B_sp1024/*_train_*.bin",
+    "val_files": "./data/datasets/fineweb10B_sp1024/*_val_*.bin"
+  },
+  "RunConfig": {
+    "run_id": "75ccc9f0-0f7d-46eb-ac85-3c13d07980f4",
+    "resume_from": "",
+    "checkpoint_every": 0,
+    "seed": 1337
+  },
+  "ScheduleConfig": {
+    "val_batch_size": 524288,
+    "val_loss_every": 999999,
+    "train_log_every": 1,
+    "iterations": 999999,
+    "warmdown_iters": 1200,
+    "warmup_steps": 5,
+    "train_batch_tokens": 491520,
+    "train_seq_len": 1024,
+    "max_wallclock_seconds": 600.0
+  },
+  "ModelCommonConfig": {
+    "model_version": "v11_brainwave",
+    "vocab_size": 1024,
+    "num_steps": 8,
+    "n_fourier_basis": 16,
+    "n_channels": 128,
+    "activation": "gelu",
+    "logit_softcap": 30.0,
+    "decay_init": 3.0
+  },
+  "V1Config": {
+    "num_heads": 8,
+    "num_kv_heads": 4,
+    "rope_base": 10000.0,
+    "qk_gain_init": 1.5
+  },
+  "V2Config": {
+    "kernel_size": 16
+  },
+  "V4Config": {
+    "n_heads": 4,
+    "transform_rank": 8,
+    "unique_steps": 5,
+    "invocations_per_step": 2
+  },
+  "WaveConfig": {
+    "slow_decay_init": 4.0,
+    "fast_decay_init": 2.0,
+    "band_split": "4,4,8"
+  },
+  "LgpConfig": {
+    "n_ops": 8
+  },
+  "GraphConfig": {
+    "interaction_rank": 8
+  },
+  "MetaStateConfig": {
+    "state_dim": 64,
+    "inner_dim": 128
+  },
+  "TpgConfig": {
+    "gumbel_tau": 1.0,
+    "halt_threshold": 0.5,
+    "ponder_lambda": 0.01
+  },
+  "SparseRegisterConfig": {
+    "k_active": 256,
+    "inner_mul": 2,
+    "parallel_waves": true,
+    "grad_checkpoint": false,
+    "embed_dim": 128
+  },
+  "PredictiveConfig": {
+    "sparsity_k": 128,
+    "aux_loss_weight": 0.1,
+    "aux_loss_decay": 0.9
+  },
+  "ColumnarConfig": {
+    "num_columns": 4,
+    "steps_per_column": 3,
+    "n_branches": 4
+  },
+  "OptimizerConfig": {
+    "lr": 0.03,
+    "beta1": 0.9,
+    "beta2": 0.999,
+    "adam_eps": 1e-08,
+    "weight_decay": 0.0,
+    "grad_clip_norm": 1.0
+  },
+  "DistributedConfig": {
+    "nccl_p2p_disable": "1",
+    "grad_accum_steps": 16,
+    "torch_compile": false,
+    "roundtrip_eval": false
+  }
+}
+[01:29:17] [init] rank=0 world_size=3 device=cuda:0 model_version=v11_brainwave
+[01:29:17] [init] loading tokenizer from ./data/tokenizers/fineweb_1024_bpe.model
+[01:29:17] [init] loading validation data from ./data/datasets/fineweb10B_sp1024/*_val_*.bin
+[01:29:18] [init] data loaded: 62021633 val tokens
+[01:29:19] [init] model built: 3425K params on cuda:0
+[01:29:19] [init] wrapping with DDP (distributed=True)
+[01:29:19] [init] DDP ready
+[01:29:19] run_id:75ccc9f0-0f7d-46eb-ac85-3c13d07980f4
+[01:29:19] model_version:v11_brainwave
+[01:29:19] model_params:3425329 trainable:3425329 vocab=dim=1024 raw:13.7MB est_int8:3.4MB
+[01:29:19] architecture:BrainWave v2
+[01:29:19] cross_position:EMA + causal decay within_position:Oscillatory primitives
+[01:29:19] config:{'vocab_size': 1024, 'num_steps': 8, 'state_dim': 64, 'inner_dim': 128, 'logit_softcap': 30.0, 'gate_dim': 64}
+[01:29:20] activation:gelu lr:0.03 grad_clip:1.0 decay_init:3.0
+[01:29:20] world_size:3 grad_accum:16 batch:491520
+[01:29:20] [init] loading training data from ./data/datasets/fineweb10B_sp1024/*_train_*.bin
+[01:29:22] [init] starting warmup (5 steps)
+[01:29:40] warmup:5/5
+[01:31:52] step:0/999999 val_loss:11.6154 val_bpb:6.8793 train_time:0ms
+[01:31:55] step:1/999999 train_loss:11.8363 time:3349ms avg:3348.8ms tok/s:146780
+[01:31:58] step:2/999999 train_loss:11.0906 time:6698ms avg:3349.2ms tok/s:147047
+[01:32:02] step:3/999999 train_loss:11.2688 time:10051ms avg:3350.3ms tok/s:146806
+[01:32:05] step:4/999999 train_loss:11.1575 time:13407ms avg:3351.7ms tok/s:147016
+[01:32:08] step:5/999999 train_loss:11.2132 time:16757ms avg:3351.5ms tok/s:146884
+[01:32:12] step:6/999999 train_loss:11.6682 time:20107ms avg:3351.1ms tok/s:146907
+[01:32:15] step:7/999999 train_loss:11.7738 time:23456ms avg:3350.9ms tok/s:146966
+[01:32:18] step:8/999999 train_loss:11.6539 time:26804ms avg:3350.4ms tok/s:147042
+[01:32:22] step:9/999999 train_loss:11.4030 time:30152ms avg:3350.2ms tok/s:146994
+[01:32:25] step:10/999999 train_loss:11.6711 time:33503ms avg:3350.3ms tok/s:146882
+[01:32:28] step:11/999999 train_loss:11.8373 time:36853ms avg:3350.3ms tok/s:146900
+[01:32:32] step:12/999999 train_loss:11.6250 time:40202ms avg:3350.2ms tok/s:146989
+[01:32:35] step:13/999999 train_loss:11.5261 time:43553ms avg:3350.2ms tok/s:146879
+[01:32:38] step:14/999999 train_loss:11.4446 time:46914ms avg:3351.0ms tok/s:146843
+[01:32:42] step:15/999999 train_loss:10.8259 time:50262ms avg:3350.8ms tok/s:146985
+[01:32:45] step:16/999999 train_loss:10.3910 time:53611ms avg:3350.7ms tok/s:147033
+[01:32:49] step:17/999999 train_loss:10.2017 time:56961ms avg:3350.6ms tok/s:146872
+[01:32:52] step:18/999999 train_loss:10.7049 time:60313ms avg:3350.7ms tok/s:146812
+[01:32:55] step:19/999999 train_loss:10.2417 time:63668ms avg:3351.0ms tok/s:146917
+[01:32:59] step:20/999999 train_loss:10.0620 time:67016ms avg:3350.8ms tok/s:147028
+[01:33:02] step:21/999999 train_loss:9.9539 time:70366ms avg:3350.7ms tok/s:146941
+[01:33:05] step:22/999999 train_loss:9.2487 time:73718ms avg:3350.8ms tok/s:146833
+[01:33:09] step:23/999999 train_loss:9.5679 time:77070ms avg:3350.9ms tok/s:146837
+[01:33:12] step:24/999999 train_loss:9.7245 time:80419ms avg:3350.8ms tok/s:146938
+[01:33:15] step:25/999999 train_loss:9.7463 time:83765ms avg:3350.6ms tok/s:147069
+[01:33:19] step:26/999999 train_loss:10.2517 time:87112ms avg:3350.5ms tok/s:147013
+[01:33:22] step:27/999999 train_loss:10.9519 time:90464ms avg:3350.5ms tok/s:146813
+[01:33:25] step:28/999999 train_loss:11.1998 time:93816ms avg:3350.6ms tok/s:146847
+[01:33:29] step:29/999999 train_loss:11.2631 time:97165ms avg:3350.5ms tok/s:146987
+[01:33:32] step:30/999999 train_loss:11.0246 time:100515ms avg:3350.5ms tok/s:146913
+[01:33:35] step:31/999999 train_loss:11.3050 time:103862ms avg:3350.4ms tok/s:147004
+[01:33:39] step:32/999999 train_loss:11.1319 time:107214ms avg:3350.4ms tok/s:146978
+[01:33:42] step:33/999999 train_loss:10.8032 time:110562ms avg:3350.4ms tok/s:146985
+[01:33:45] step:34/999999 train_loss:10.3217 time:113911ms avg:3350.3ms tok/s:146976
+[01:33:49] step:35/999999 train_loss:10.2052 time:117259ms avg:3350.3ms tok/s:146964
+[01:33:52] step:36/999999 train_loss:9.9535 time:120608ms avg:3350.2ms tok/s:146976
+[01:33:56] step:37/999999 train_loss:9.8847 time:123953ms avg:3350.1ms tok/s:147104
+[01:33:59] step:38/999999 train_loss:9.6409 time:127310ms avg:3350.3ms tok/s:146971
+[01:34:02] step:39/999999 train_loss:9.6767 time:130661ms avg:3350.3ms tok/s:146857
+[01:34:06] step:40/999999 train_loss:9.9051 time:134013ms avg:3350.3ms tok/s:146850
+[01:34:09] step:41/999999 train_loss:10.2854 time:137364ms avg:3350.3ms tok/s:146905
+[01:34:12] step:42/999999 train_loss:10.9137 time:140714ms avg:3350.3ms tok/s:146889
+[01:34:16] step:43/999999 train_loss:11.0205 time:144063ms avg:3350.3ms tok/s:147009
+[01:34:19] step:44/999999 train_loss:11.1117 time:147428ms avg:3350.6ms tok/s:146872
+[01:34:22] step:45/999999 train_loss:11.2593 time:150776ms avg:3350.6ms tok/s:146965
+[01:34:26] step:46/999999 train_loss:10.9482 time:154127ms avg:3350.6ms tok/s:147055
+[01:34:29] step:47/999999 train_loss:11.0946 time:157475ms avg:3350.5ms tok/s:147006
+[01:34:32] step:48/999999 train_loss:11.2092 time:160827ms avg:3350.6ms tok/s:146823
+[01:34:36] step:49/999999 train_loss:11.0654 time:164176ms avg:3350.5ms tok/s:146989
+[01:34:39] step:50/999999 train_loss:11.0405 time:167525ms avg:3350.5ms tok/s:146930
+[01:34:42] step:51/999999 train_loss:11.2077 time:170874ms avg:3350.5ms tok/s:146968
+[01:34:46] step:52/999999 train_loss:11.2781 time:174223ms avg:3350.4ms tok/s:146963
+[01:34:49] step:53/999999 train_loss:10.9177 time:177574ms avg:3350.5ms tok/s:146863
+[01:34:52] step:54/999999 train_loss:10.4354 time:180922ms avg:3350.4ms tok/s:146992
+[01:34:56] step:55/999999 train_loss:10.7647 time:184272ms avg:3350.4ms tok/s:146896
+[01:34:59] step:56/999999 train_loss:10.6548 time:187622ms avg:3350.4ms tok/s:146969
+[01:35:03] step:57/999999 train_loss:10.4071 time:190970ms avg:3350.4ms tok/s:146967
+[01:35:06] step:58/999999 train_loss:10.7960 time:194320ms avg:3350.3ms tok/s:146905
+[01:35:09] step:59/999999 train_loss:11.1348 time:197670ms avg:3350.3ms tok/s:146892
+[01:35:13] step:60/999999 train_loss:11.2927 time:201018ms avg:3350.3ms tok/s:146995
+[01:35:16] step:61/999999 train_loss:10.9391 time:204367ms avg:3350.3ms tok/s:146968
+[01:35:19] step:62/999999 train_loss:10.8142 time:207716ms avg:3350.3ms tok/s:147033
+[01:35:23] step:63/999999 train_loss:11.1321 time:211068ms avg:3350.3ms tok/s:146839
+[01:35:26] step:64/999999 train_loss:12.2876 time:214419ms avg:3350.3ms tok/s:146865
+[01:35:29] step:65/999999 train_loss:13.9517 time:217777ms avg:3350.4ms tok/s:146984
+[01:35:33] step:66/999999 train_loss:12.3518 time:221125ms avg:3350.4ms tok/s:146992
+[01:35:36] step:67/999999 train_loss:11.1831 time:224474ms avg:3350.4ms tok/s:146993
+[01:35:39] step:68/999999 train_loss:9.8666 time:227822ms avg:3350.3ms tok/s:146951
+[01:35:43] step:69/999999 train_loss:9.5678 time:231182ms avg:3350.5ms tok/s:146914
+[01:35:46] step:70/999999 train_loss:9.3138 time:234534ms avg:3350.5ms tok/s:146848
+[01:35:49] step:71/999999 train_loss:9.2643 time:237883ms avg:3350.5ms tok/s:146950
+[01:35:53] step:72/999999 train_loss:9.1927 time:241236ms avg:3350.5ms tok/s:146797
+[01:35:56] step:73/999999 train_loss:9.0605 time:244587ms avg:3350.5ms tok/s:146869
+[01:35:59] step:74/999999 train_loss:9.1916 time:247935ms avg:3350.5ms tok/s:147015
+[01:36:03] step:75/999999 train_loss:9.0334 time:251283ms avg:3350.4ms tok/s:146993
+[01:36:06] step:76/999999 train_loss:9.0377 time:254633ms avg:3350.4ms tok/s:146893
+[01:36:10] step:77/999999 train_loss:9.0116 time:257981ms avg:3350.4ms tok/s:147000
+[01:36:13] step:78/999999 train_loss:9.2007 time:261328ms avg:3350.4ms tok/s:147082
+[01:36:16] step:79/999999 train_loss:10.3972 time:264679ms avg:3350.4ms tok/s:146863
+[01:36:20] step:80/999999 train_loss:11.6984 time:268028ms avg:3350.3ms tok/s:147007
+[01:36:23] step:81/999999 train_loss:11.4887 time:271374ms avg:3350.3ms tok/s:147050
+[01:36:26] step:82/999999 train_loss:10.5618 time:274725ms avg:3350.3ms tok/s:146871
+[01:36:30] step:83/999999 train_loss:10.0417 time:278077ms avg:3350.3ms tok/s:146922
+[01:36:33] step:84/999999 train_loss:9.7870 time:281424ms avg:3350.3ms tok/s:147045
+[01:36:36] step:85/999999 train_loss:9.9919 time:284773ms avg:3350.3ms tok/s:146964
+[01:36:40] step:86/999999 train_loss:9.1404 time:288126ms avg:3350.3ms tok/s:146774
+[01:36:43] step:87/999999 train_loss:8.8742 time:291478ms avg:3350.3ms tok/s:146801
+[01:36:46] step:88/999999 train_loss:8.9345 time:294825ms avg:3350.3ms tok/s:147087
+[01:36:50] step:89/999999 train_loss:8.8169 time:298176ms avg:3350.3ms tok/s:146854
+[01:36:53] step:90/999999 train_loss:8.9136 time:301527ms avg:3350.3ms tok/s:146925
+[01:36:56] step:91/999999 train_loss:9.0441 time:304874ms avg:3350.3ms tok/s:147012
+[01:37:00] step:92/999999 train_loss:9.1754 time:308224ms avg:3350.3ms tok/s:146890
+[01:37:03] step:93/999999 train_loss:9.2174 time:311574ms avg:3350.3ms tok/s:146916
+[01:37:06] step:94/999999 train_loss:8.9775 time:314923ms avg:3350.2ms tok/s:146951
+[01:37:10] step:95/999999 train_loss:9.0595 time:318271ms avg:3350.2ms tok/s:146984
+[01:37:13] step:96/999999 train_loss:9.0631 time:321621ms avg:3350.2ms tok/s:146938
+[01:37:17] step:97/999999 train_loss:9.0261 time:324967ms avg:3350.2ms tok/s:147048
+[01:37:20] step:98/999999 train_loss:8.9615 time:328315ms avg:3350.2ms tok/s:147004
+[01:37:23] step:99/999999 train_loss:9.0231 time:331664ms avg:3350.1ms tok/s:146933
+[01:37:27] step:100/999999 train_loss:9.0017 time:335013ms avg:3350.1ms tok/s:146947
+[01:37:30] step:101/999999 train_loss:8.7072 time:338362ms avg:3350.1ms tok/s:146975
+[01:37:33] step:102/999999 train_loss:8.4153 time:341710ms avg:3350.1ms tok/s:147000
+[01:37:37] step:103/999999 train_loss:8.1825 time:345059ms avg:3350.1ms tok/s:146985
+[01:37:40] step:104/999999 train_loss:8.0409 time:348409ms avg:3350.1ms tok/s:146912
+[01:37:43] step:105/999999 train_loss:7.9898 time:351759ms avg:3350.1ms tok/s:146957
+[01:37:47] step:106/999999 train_loss:8.0641 time:355125ms avg:3350.2ms tok/s:146967
+[01:37:50] step:107/999999 train_loss:8.0598 time:358483ms avg:3350.3ms tok/s:146930
+[01:37:53] step:108/999999 train_loss:8.0038 time:361832ms avg:3350.3ms tok/s:146930
+[01:37:57] step:109/999999 train_loss:7.8975 time:365179ms avg:3350.3ms tok/s:147089
+[01:38:00] step:110/999999 train_loss:7.9265 time:368529ms avg:3350.3ms tok/s:146902
+[01:38:03] step:111/999999 train_loss:7.9366 time:371879ms avg:3350.3ms tok/s:146890
+[01:38:07] step:112/999999 train_loss:7.8123 time:375228ms avg:3350.3ms tok/s:146936
+[01:38:10] step:113/999999 train_loss:7.7914 time:378584ms avg:3350.3ms tok/s:146976
+[01:38:13] step:114/999999 train_loss:7.6828 time:381932ms avg:3350.3ms tok/s:146998
+[01:38:17] step:115/999999 train_loss:7.6059 time:385281ms avg:3350.3ms tok/s:146991
+[01:38:20] step:116/999999 train_loss:7.5689 time:388631ms avg:3350.3ms tok/s:146956
+[01:38:24] step:117/999999 train_loss:7.5585 time:391979ms avg:3350.2ms tok/s:147023
+[01:38:27] step:118/999999 train_loss:7.4757 time:395331ms avg:3350.3ms tok/s:146807
+[01:38:30] step:119/999999 train_loss:7.4521 time:398680ms avg:3350.3ms tok/s:146969
+[01:38:34] step:120/999999 train_loss:7.4273 time:402027ms avg:3350.2ms tok/s:147062
+[01:38:37] step:121/999999 train_loss:7.3973 time:405382ms avg:3350.3ms tok/s:146858
+[01:38:40] step:122/999999 train_loss:7.3803 time:408732ms avg:3350.3ms tok/s:146916
+[01:38:44] step:123/999999 train_loss:7.3539 time:412078ms avg:3350.2ms tok/s:147060
+[01:38:47] step:124/999999 train_loss:7.4072 time:415427ms avg:3350.2ms tok/s:146966
+[01:38:50] step:125/999999 train_loss:7.3865 time:418779ms avg:3350.2ms tok/s:146883
+[01:38:54] step:126/999999 train_loss:7.3923 time:422126ms avg:3350.2ms tok/s:147007
+[01:38:57] step:127/999999 train_loss:7.3991 time:425471ms avg:3350.2ms tok/s:147104
+[01:39:00] step:128/999999 train_loss:7.3796 time:428825ms avg:3350.2ms tok/s:146779
+[01:39:04] step:129/999999 train_loss:7.4116 time:432176ms avg:3350.2ms tok/s:146881
+[01:39:07] step:130/999999 train_loss:7.3771 time:435526ms avg:3350.2ms tok/s:146895
+[01:39:10] step:131/999999 train_loss:7.3879 time:438875ms avg:3350.2ms tok/s:146960
+[01:39:14] step:132/999999 train_loss:7.3292 time:442223ms avg:3350.2ms tok/s:147006
+[01:39:17] step:133/999999 train_loss:7.3140 time:445575ms avg:3350.2ms tok/s:146830
+[01:39:20] step:134/999999 train_loss:7.3630 time:448926ms avg:3350.2ms tok/s:146869
+[01:39:24] step:135/999999 train_loss:7.4961 time:452274ms avg:3350.2ms tok/s:147016
+[01:39:27] step:136/999999 train_loss:7.5759 time:455624ms avg:3350.2ms tok/s:146866
+[01:39:31] step:137/999999 train_loss:7.8132 time:458972ms avg:3350.2ms tok/s:147009
+[01:39:34] step:138/999999 train_loss:7.5055 time:462323ms avg:3350.2ms tok/s:146859
+[01:39:37] step:139/999999 train_loss:7.5037 time:465673ms avg:3350.2ms tok/s:146901
+[01:39:41] step:140/999999 train_loss:7.4966 time:469024ms avg:3350.2ms tok/s:146880
+[01:39:44] step:141/999999 train_loss:7.5201 time:472373ms avg:3350.2ms tok/s:146935
+[01:39:47] step:142/999999 train_loss:7.4631 time:475721ms avg:3350.1ms tok/s:147007
+[01:39:51] step:143/999999 train_loss:7.4334 time:479072ms avg:3350.2ms tok/s:146869
+[01:39:54] step:144/999999 train_loss:7.4379 time:482420ms avg:3350.1ms tok/s:146987
+[01:39:57] step:145/999999 train_loss:7.3860 time:485771ms avg:3350.1ms tok/s:146906
+[01:40:01] step:146/999999 train_loss:7.3722 time:489120ms avg:3350.1ms tok/s:146947
+[01:40:04] step:147/999999 train_loss:7.3950 time:492497ms avg:3350.3ms tok/s:145717
+[01:40:07] step:148/999999 train_loss:7.3619 time:495857ms avg:3350.4ms tok/s:146500
+[01:40:11] step:149/999999 train_loss:7.3576 time:499208ms avg:3350.4ms tok/s:146836
+[01:40:14] step:150/999999 train_loss:7.3811 time:502560ms avg:3350.4ms tok/s:146858
+[01:40:17] step:151/999999 train_loss:7.3779 time:505915ms avg:3350.4ms tok/s:146663
+[01:40:21] step:152/999999 train_loss:7.3379 time:509261ms avg:3350.4ms tok/s:147065
+[01:40:24] step:153/999999 train_loss:7.3686 time:512609ms avg:3350.4ms tok/s:147025
+[01:40:28] step:154/999999 train_loss:7.3658 time:515958ms avg:3350.4ms tok/s:146956
+[01:40:31] step:155/999999 train_loss:7.3730 time:519307ms avg:3350.4ms tok/s:146952
+[01:40:34] step:156/999999 train_loss:7.4016 time:522657ms avg:3350.4ms tok/s:146927
+[01:40:38] step:157/999999 train_loss:7.3963 time:526007ms avg:3350.4ms tok/s:146893
+[01:40:41] step:158/999999 train_loss:7.3899 time:529357ms avg:3350.4ms tok/s:146943
+[01:40:44] step:159/999999 train_loss:7.3370 time:532707ms avg:3350.4ms tok/s:146936
+[01:40:48] step:160/999999 train_loss:7.3436 time:536058ms avg:3350.4ms tok/s:146935
+[01:40:51] step:161/999999 train_loss:7.3358 time:539404ms avg:3350.3ms tok/s:147081
+[01:40:54] step:162/999999 train_loss:7.3116 time:542751ms avg:3350.3ms tok/s:147028
+[01:40:58] step:163/999999 train_loss:7.3263 time:546099ms avg:3350.3ms tok/s:147020
+[01:41:01] step:164/999999 train_loss:7.3090 time:549449ms avg:3350.3ms tok/s:146915
+[01:41:04] step:165/999999 train_loss:7.3203 time:552799ms avg:3350.3ms tok/s:146947
+[01:41:08] step:166/999999 train_loss:7.3109 time:556160ms avg:3350.4ms tok/s:146923
+[01:41:11] step:167/999999 train_loss:7.2906 time:559509ms avg:3350.4ms tok/s:147003
+[01:41:14] step:168/999999 train_loss:7.2929 time:562859ms avg:3350.4ms tok/s:146890
+[01:41:18] step:169/999999 train_loss:7.2948 time:566210ms avg:3350.4ms tok/s:146878
+[01:41:21] step:170/999999 train_loss:7.3005 time:569557ms avg:3350.3ms tok/s:147027
+[01:41:24] step:171/999999 train_loss:7.3045 time:572907ms avg:3350.3ms tok/s:146901
+[01:41:28] step:172/999999 train_loss:7.3085 time:576258ms avg:3350.3ms tok/s:146887
+[01:41:31] step:173/999999 train_loss:7.3036 time:579610ms avg:3350.3ms tok/s:146869
+[01:41:35] step:174/999999 train_loss:7.3005 time:582957ms avg:3350.3ms tok/s:147022
+[01:41:38] step:175/999999 train_loss:7.2887 time:586303ms avg:3350.3ms tok/s:147043
+[01:41:41] step:176/999999 train_loss:7.3145 time:589650ms avg:3350.3ms tok/s:147036
+[01:41:45] step:177/999999 train_loss:7.2854 time:593003ms avg:3350.3ms tok/s:146885
+[01:41:48] step:178/999999 train_loss:7.3166 time:596354ms avg:3350.3ms tok/s:146894
+[01:41:51] step:179/999999 train_loss:7.2997 time:599704ms avg:3350.3ms tok/s:146904
+[01:41:55] step:180/999999 train_loss:7.2998 time:603052ms avg:3350.3ms tok/s:146980
+[01:44:03] step:180/999999 val_loss:7.2999 val_bpb:4.3234 train_time:603059ms
+[01:44:03] stopping_early: step:180/999999
+[01:44:04] checkpoint:logs/75ccc9f0-0f7d-46eb-ac85-3c13d07980f4_ckpt.pt step:180
+[01:44:04] saved:logs/75ccc9f0-0f7d-46eb-ac85-3c13d07980f4_model.pt bytes:13741963
+[01:44:05] quantized:logs/75ccc9f0-0f7d-46eb-ac85-3c13d07980f4_model.int8.ptz bytes:14036140 ratio:1.40x
+[01:44:05] manifest:logs/75ccc9f0-0f7d-46eb-ac85-3c13d07980f4_manifest.json

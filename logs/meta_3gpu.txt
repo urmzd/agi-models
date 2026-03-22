@@ -1,0 +1,4505 @@
+[20:49:40] """
+RegisterGPT v3 — Register machine with associative memory, PyTorch/CUDA training.
+Outer-product memory for cross-position mixing. Fourier ops for within-position transforms.
+No attention. No embedding. No output projection.
+Compatible with torchrun for multi-GPU training.
+"""
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from pydantic import Field, computed_field
+from pydantic_settings import BaseSettings
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# -----------------------------
+# HYPERPARAMETERS
+# -----------------------------
+
+
+class DataConfig(BaseSettings):
+    data_path: str = "./data/datasets/fineweb10B_sp1024"
+    tokenizer_path: str = "./data/tokenizers/fineweb_1024_bpe.model"
+
+    @computed_field
+    @property
+    def train_files(self) -> str:
+        return os.path.join(self.data_path, "fineweb_train_*.bin")
+
+    @computed_field
+    @property
+    def val_files(self) -> str:
+        return os.path.join(self.data_path, "fineweb_val_*.bin")
+
+
+class RunConfig(BaseSettings):
+    run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    resume_from: str = Field("", validation_alias="RESUME")
+    checkpoint_every: int = 500
+    seed: int = 1337
+
+
+class ScheduleConfig(BaseSettings):
+    val_batch_size: int = 524_288
+    val_loss_every: int = 1000
+    train_log_every: int = 200
+    iterations: int = 500
+    warmdown_iters: int = 1200
+    warmup_steps: int = 20
+    train_batch_tokens: int = 524_288
+    train_seq_len: int = 1024
+    max_wallclock_seconds: Optional[float] = None
+
+
+class ModelCommonConfig(BaseSettings):
+    model_version: str = "v3"
+    vocab_size: int = 1024
+    num_steps: int = 8
+    n_fourier_basis: int = 16
+    n_channels: int = 128
+    activation: str = "gelu"
+    logit_softcap: float = 30.0
+    decay_init: float = 3.0
+
+
+class V1Config(BaseSettings):
+    num_heads: int = 8
+    num_kv_heads: int = 4
+    rope_base: float = 10000.0
+    qk_gain_init: float = 1.5
+
+
+class V2Config(BaseSettings):
+    kernel_size: int = 16
+
+
+class V4Config(BaseSettings):
+    n_heads: int = 4
+    transform_rank: int = 8
+    unique_steps: int = 5
+    invocations_per_step: int = 2
+
+
+class WaveConfig(BaseSettings):
+    slow_decay_init: float = 4.0
+    fast_decay_init: float = 2.0
+    band_split: str = "4,4,8"
+
+
+class LgpConfig(BaseSettings):
+    n_ops: int = 8
+
+
+class GraphConfig(BaseSettings):
+    interaction_rank: int = 64
+
+
+class MetaStateConfig(BaseSettings):
+    state_dim: int = 64
+    inner_dim: int = 128
+
+
+class TpgConfig(BaseSettings):
+    gumbel_tau: float = 1.0
+    halt_threshold: float = 0.5
+    ponder_lambda: float = 0.01
+
+
+class SparseRegisterConfig(BaseSettings):
+    k_active: int = 256
+    inner_mul: int = 2
+    parallel_waves: bool = True
+    grad_checkpoint: bool = False
+
+
+class OptimizerConfig(BaseSettings):
+    lr: float = 0.03
+    beta1: float = 0.9
+    beta2: float = 0.999
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.0
+    grad_clip_norm: float = 1.0
+
+
+class Hyperparameters:
+    def __init__(self) -> None:
+        self.data = DataConfig()
+        self.run = RunConfig()
+        self.schedule = ScheduleConfig()
+        self.model_common = ModelCommonConfig()
+        self.v1 = V1Config()
+        self.v2 = V2Config()
+        self.v4 = V4Config()
+        self.wave = WaveConfig()
+        self.lgp = LgpConfig()
+        self.graph = GraphConfig()
+        self.meta = MetaStateConfig()
+        self.tpg = TpgConfig()
+        self.sparse = SparseRegisterConfig()
+        self.optimizer = OptimizerConfig()
+        self._groups = [
+            self.data, self.run, self.schedule, self.model_common,
+            self.v1, self.v2, self.v4, self.wave, self.lgp,
+            self.graph, self.meta, self.tpg, self.sparse, self.optimizer,
+        ]
+
+    def __getattr__(self, name: str):
+        for group in self._groups:
+            try:
+                return getattr(group, name)
+            except AttributeError:
+                continue
+        raise AttributeError(f"Hyperparameters has no field {name!r}")
+
+
+# Patterns for control tensors (kept in float32)
+CONTROL_TENSOR_NAME_PATTERNS = (
+    "mem_scale", "op_scale", "read_coeffs", "write_coeffs",
+    "channel_mix", "bias", "out_scale", "logit_scale", "decay_logit",
+    "coeffs",
+    # v4 additions
+    "diag", "mix_down", "mix_up", "decay_logits", "_override",
+    # gauss additions
+    "freq_to_ch", "ch_to_freq", "weight",
+    # lgp additions
+    "op_logits", "op_weights", "op_biases",
+    # graph additions
+    "q_scale", "k_scale", "diag", "prop_scale", "interact_scale",
+    # tpg additions
+    "halt_proj", "act_selector", "scale_gate", "t_scale",
+    # sparse register additions (v12)
+    "mem_scale", "write_scale", "mlp_bias",
+)
+
+# -----------------------------
+# VALIDATION + QUANTIZATION
+# -----------------------------
+
+def build_sentencepiece_luts(sp, vocab_size, device):
+    sv = int(sp.vocab_size())
+    ts = max(sv, vocab_size)
+    bb = np.zeros((ts,), dtype=np.int16)
+    hs = np.zeros((ts,), dtype=np.bool_)
+    ib = np.ones((ts,), dtype=np.bool_)
+    for tid in range(sv):
+        if sp.is_control(tid) or sp.is_unknown(tid) or sp.is_unused(tid):
+            continue
+        ib[tid] = False
+        if sp.is_byte(tid):
+            bb[tid] = 1
+            continue
+        piece = sp.id_to_piece(tid)
+        if piece.startswith("▁"):
+            hs[tid] = True
+            piece = piece[1:]
+        bb[tid] = len(piece.encode("utf-8"))
+    return (torch.tensor(bb, dtype=torch.int16, device=device),
+            torch.tensor(hs, dtype=torch.bool, device=device),
+            torch.tensor(ib, dtype=torch.bool, device=device))
+
+
+def load_data_shard(file):
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Bad header: {file}")
+    n = int(header[2])
+    tokens = np.fromfile(file, dtype="<u2", count=n, offset=256 * 4)
+    return torch.from_numpy(tokens.astype(np.uint16, copy=False))
+
+
+def load_validation_tokens(pattern, seq_len):
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files: {pattern}")
+    tokens = torch.cat([load_data_shard(f) for f in files]).contiguous()
+    usable = ((tokens.numel() - 1) // seq_len) * seq_len
+    return tokens[:usable + 1]
+
+
+class TokenStream:
+    def __init__(self, pattern):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files: {pattern}")
+        self.file_idx = 0
+        self.tokens = load_data_shard(self.files[0])
+        self.pos = 0
+
+    def _advance(self):
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = 0
+
+    def take(self, n):
+        chunks = []
+        left = n
+        while left > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance()
+                continue
+            k = min(left, avail)
+            chunks.append(self.tokens[self.pos:self.pos + k])
+            self.pos += k
+            left -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedTokenLoader:
+    def __init__(self, pattern, rank, world_size, device):
+        self.rank, self.world_size, self.device = rank, world_size, device
+        self.stream = TokenStream(pattern)
+
+    def next_batch(self, global_tokens, seq_len, grad_accum_steps):
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        span = local_tokens + 1
+        chunk = self.stream.take(span * self.world_size)
+        start = self.rank * span
+        local = chunk[start:start + span].to(dtype=torch.int64)
+        x, y = local[:-1].reshape(-1, seq_len), local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+def eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl):
+    lbt = args.val_batch_size // (world_size * grad_accum_steps)
+    if lbt < args.train_seq_len:
+        raise ValueError("VAL_BATCH_SIZE too small")
+    lbs = lbt // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    ss, se = (total_seqs * rank) // world_size, (total_seqs * (rank + 1)) // world_size
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    tok_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    model.eval()
+    with torch.inference_mode():
+        for bs in range(ss, se, lbs):
+            be = min(bs + lbs, se)
+            local = val_tokens[bs * args.train_seq_len:be * args.train_seq_len + 1].to(device=device, dtype=torch.int64)
+            x, y = local[:-1].reshape(-1, args.train_seq_len), local[1:].reshape(-1, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                bl = model(x, y).detach()
+            ct = float(y.numel())
+            loss_sum += bl.to(torch.float64) * ct
+            tok_count += ct
+            tb = bbl[y.reshape(-1)].to(torch.float64)
+            tb += (hsl[y.reshape(-1)] & ~ibl[x.reshape(-1)]).to(torch.float64)
+            byte_count += tb.sum()
+    if dist.is_available() and dist.is_initialized():
+        for t in (loss_sum, tok_count, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    vl = (loss_sum / tok_count).item()
+    model.train()
+    return vl, vl / math.log(2.0) * (tok_count.item() / byte_count.item())
+
+
+INT8_CLIP_Q = 99.99984 / 100.0
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+
+def quantize_state_dict_int8(sd):
+    quantized, scales, dtypes, passthrough = {}, {}, {}, {}
+    passthrough_orig_dtypes, qmeta = {}, {}
+    stats = dict.fromkeys(("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0)
+    for name, tensor in sd.items():
+        t = tensor.detach().cpu().contiguous()
+        stats["param_count"] += t.numel()
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += t.numel() * t.element_size()
+        if not t.is_floating_point():
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += t.numel() * t.element_size()
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+                kept = t.float().contiguous()
+            elif t.dtype in {torch.float32, torch.bfloat16}:
+                passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+                kept = t.to(torch.float16).contiguous()
+            else:
+                kept = t
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += kept.numel() * kept.element_size()
+            continue
+        stats["num_float_tensors"] += 1
+        t32 = t.float()
+        if t32.ndim == 2:
+            ca = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            clipped = torch.clamp(t32, -ca[:, None], ca[:, None])
+            s = (ca / 127.0).clamp_min(1.0 / 127.0)
+            q = torch.clamp(torch.round(clipped / s[:, None]), -127, 127).to(torch.int8)
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            scales[name] = s.to(torch.float16).contiguous()
+        else:
+            ca = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+            s = torch.tensor(ca / 127.0 if ca > 0 else 1.0, dtype=torch.float32)
+            q = torch.clamp(torch.round(torch.clamp(t32, -ca, ca) / s), -127, 127).to(torch.int8)
+            scales[name] = s
+        quantized[name] = q.contiguous()
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += q.numel() + (scales[name].numel() * scales[name].element_size())
+    obj = {"__quant_format__": "int8_clean_per_row_v1", "quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
+    if qmeta: obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes: obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_int8(obj):
+    out = {}
+    qmeta = obj.get("qmeta", {})
+    pod = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dt = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name].to(torch.float32)
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dt)
+        else:
+            out[name] = (q.float() * s.item()).to(dt)
+    for name, t in obj["passthrough"].items():
+        od = pod.get(name)
+        out[name] = t.to(getattr(torch, od)) if isinstance(od, str) else t.detach().cpu()
+    return out
+
+
+# -----------------------------
+# MODEL
+# -----------------------------
+
+def apply_activation(x, activation):
+    if activation == "gelu":
+        return F.gelu(x)
+    elif activation == "relu2":
+        return F.relu(x).square()
+    elif activation == "swish":
+        return F.silu(x)
+    return F.gelu(x)
+
+
+class FourierProjection(nn.Module):
+    """Project vocab-space to channels via Fourier basis coefficients."""
+    def __init__(self, n_basis, n_channels, soft=False):
+        super().__init__()
+        self.soft = soft
+        self.coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * 0.02)
+
+    def forward(self, basis):
+        w = basis @ self.coeffs.T
+        if self.soft:
+            w = torch.softmax(w, dim=0)
+        return w
+
+
+class AssociativeMemoryStep(nn.Module):
+    """Cross-position mixing via causal decay-weighted associative memory (parallel)."""
+    def __init__(self, n_basis, n_channels, decay_init=3.0):
+        super().__init__()
+        self.n_channels = n_channels
+        self.query_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.key_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.value_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.output_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        B, T, V = x.shape
+        dtype = x.dtype
+
+        q_w = self.query_proj(basis).to(dtype)
+        k_w = self.key_proj(basis).to(dtype)
+        v_w = self.value_proj(basis).to(dtype)
+        o_w = self.output_proj(basis).to(dtype)
+
+        queries = x @ q_w
+        keys = x @ k_w
+        values = x @ v_w
+
+        # Content similarity in channel space
+        scores = torch.bmm(queries, keys.transpose(1, 2))  # (B, T, T)
+
+        # Causal decay mask: decay^(t-s-1) for s < t, 0 otherwise
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)  # (T, T)
+        causal_mask = (diff > 0)
+        decay_weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal_mask
+        scores = scores * decay_weights.to(dtype).unsqueeze(0)
+
+        # Retrieve: weighted sum of values
+        retrieved = torch.bmm(scores, values)  # (B, T, C)
+
+        return retrieved @ o_w.T * self.out_scale.to(dtype)
+
+
+class FourierRegisterOp(nn.Module):
+    """Within-position register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu"):
+        super().__init__()
+        self.activation = activation
+        s = 0.02
+        self.read_coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * s)
+        self.write_coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * s)
+        self.channel_mix = nn.Parameter(torch.randn(n_channels, n_channels) * s)
+        self.bias = nn.Parameter(torch.zeros(n_channels))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        read_p = torch.softmax(basis @ self.read_coeffs.T, dim=0).to(x.dtype)
+        values = x @ read_p
+        values = values @ self.channel_mix.to(x.dtype) + self.bias.to(x.dtype)
+        values = apply_activation(values, self.activation)
+        write_p = (basis @ self.write_coeffs.T).to(x.dtype)
+        return values @ write_p.T * self.out_scale.to(x.dtype)
+
+
+class RegisterStep(nn.Module):
+    """One LGP instruction: memory read/write + register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.memory = AssociativeMemoryStep(n_basis, n_channels, decay_init)
+        self.register_op = FourierRegisterOp(n_basis, n_channels, activation)
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x, basis):
+        D = x.size(-1)
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)), basis)
+        x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)), basis)
+        return x
+
+
+class AssocRegisterLM(nn.Module):
+    """Register machine with associative memory. No attention. No embedding."""
+    def __init__(self, vocab_size, num_steps, n_fourier_basis, n_channels,
+                 logit_softcap, activation="gelu", decay_init=0.95):
+        super().__init__()
+        dim = vocab_size
+        self.vocab_size = vocab_size
+        self.num_steps = num_steps
+        self.logit_softcap = logit_softcap
+
+        self.steps = nn.ModuleList([
+            RegisterStep(n_fourier_basis, n_channels, activation, decay_init)
+            for _ in range(num_steps)
+        ])
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+        positions = torch.arange(dim, dtype=torch.float32) / dim
+        basis = torch.zeros(dim, 2 * n_fourier_basis)
+        for k in range(n_fourier_basis):
+            basis[:, 2 * k] = torch.cos(2 * math.pi * (k + 1) * positions)
+            basis[:, 2 * k + 1] = torch.sin(2 * math.pi * (k + 1) * positions)
+        self.register_buffer("fourier_basis", basis, persistent=True)
+
+    def forward(self, input_ids, target_ids):
+        V = self.vocab_size
+        x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
+        x = F.rms_norm(x, (V,))
+        basis = self.fourier_basis
+
+        for step in self.steps:
+            x = step(x, basis)
+
+        x = F.rms_norm(x, (V,))
+        logits = x * self.logit_scale.to(x.dtype)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="mean")
+
+
+# -----------------------------
+# GAUSS MODEL (FFT-based)
+# -----------------------------
+
+class GaussProjection(nn.Module):
+    """Project vocab-space to channels via FFT."""
+    def __init__(self, n_freq, n_channels):
+        super().__init__()
+        self.n_freq = n_freq
+        self.weight = nn.Parameter(torch.randn(n_channels, 2 * n_freq) * 0.02)
+
+    def forward(self, x):
+        X = torch.fft.rfft(x.float(), dim=-1)
+        X = X[..., 1:self.n_freq + 1]
+        X_ri = torch.cat([X.real, X.imag], dim=-1)
+        return (X_ri @ self.weight.T).to(x.dtype)
+
+
+class GaussSynthesis(nn.Module):
+    """Project channels back to vocab-space via IFFT."""
+    def __init__(self, n_freq, n_channels, vocab_size):
+        super().__init__()
+        self.n_freq = n_freq
+        self.vocab_size = vocab_size
+        self.weight = nn.Parameter(torch.randn(2 * n_freq, n_channels) * 0.02)
+
+    def forward(self, h):
+        n, V = self.n_freq, self.vocab_size
+        Y_ri = h.float() @ self.weight
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
+        shape = list(h.shape[:-1]) + [V // 2 + 1]
+        full = torch.zeros(shape, dtype=Y.dtype, device=h.device)
+        full[..., 1:n + 1] = Y
+        return torch.fft.irfft(full, n=V, dim=-1).to(h.dtype)
+
+
+class GaussMemoryStep(nn.Module):
+    """Cross-position mixing via FFT projections + causal decay memory."""
+    def __init__(self, n_freq, n_channels, vocab_size, decay_init=3.0):
+        super().__init__()
+        self.n_channels = n_channels
+        self.q_proj = GaussProjection(n_freq, n_channels)
+        self.k_proj = GaussProjection(n_freq, n_channels)
+        self.v_proj = GaussProjection(n_freq, n_channels)
+        self.o_proj = GaussSynthesis(n_freq, n_channels, vocab_size)
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        B, T, V = x.shape
+        dtype = x.dtype
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        scores = torch.bmm(queries, keys.transpose(1, 2))
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+        causal = (diff > 0)
+        weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal
+        scores = scores * weights.to(dtype).unsqueeze(0)
+        retrieved = torch.bmm(scores, values)
+        return self.o_proj(retrieved) * self.out_scale.to(dtype)
+
+
+class GaussRegisterOp(nn.Module):
+    """Within-position transform via FFT → channels → IFFT."""
+    def __init__(self, n_freq, n_channels, vocab_size, activation="gelu"):
+        super().__init__()
+        self.activation = activation
+        self.n_freq = n_freq
+        self.vocab_size = vocab_size
+        s = 0.02
+        self.freq_to_ch = nn.Parameter(torch.randn(n_channels, 2 * n_freq) * s)
+        self.channel_mix = nn.Parameter(torch.randn(n_channels, n_channels) * s)
+        self.bias = nn.Parameter(torch.zeros(n_channels))
+        self.ch_to_freq = nn.Parameter(torch.randn(2 * n_freq, n_channels) * s)
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        B, T, V = x.shape
+        dtype = x.dtype
+        n = self.n_freq
+        X = torch.fft.rfft(x.float(), dim=-1)
+        X = X[..., 1:n + 1]
+        X_ri = torch.cat([X.real, X.imag], dim=-1)
+        h = X_ri @ self.freq_to_ch.T
+        h = h @ self.channel_mix + self.bias
+        h = apply_activation(h, self.activation)
+        Y_ri = h @ self.ch_to_freq.T
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
+        full = torch.zeros(B, T, V // 2 + 1, dtype=Y.dtype, device=x.device)
+        full[..., 1:n + 1] = Y
+        return torch.fft.irfft(full, n=V, dim=-1).to(dtype) * self.out_scale.to(dtype)
+
+
+class GaussRegisterStep(nn.Module):
+    """One step: FFT memory + FFT register op."""
+    def __init__(self, n_freq, n_channels, vocab_size, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.memory = GaussMemoryStep(n_freq, n_channels, vocab_size, decay_init)
+        self.register_op = GaussRegisterOp(n_freq, n_channels, vocab_size, activation)
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        D = x.size(-1)
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)))
+        x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)))
+        return x
+
+
+class GaussRegisterGPT(nn.Module):
+    """Register machine with FFT-based operations. No stored Fourier basis."""
+    def __init__(self, vocab_size, num_steps, n_freq, n_channels,
+                 logit_softcap, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.num_steps = num_steps
+        self.logit_softcap = logit_softcap
+        self.steps = nn.ModuleList([
+            GaussRegisterStep(n_freq, n_channels, vocab_size, activation, decay_init)
+            for _ in range(num_steps)
+        ])
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, input_ids, target_ids):
+        V = self.vocab_size
+        x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
+        x = F.rms_norm(x, (V,))
+        for step in self.steps:
+            x = step(x)
+        x = F.rms_norm(x, (V,))
+        logits = x * self.logit_scale.to(x.dtype)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="mean")
+
+
+# -----------------------------
+# V4 MODEL (param-optimized, see model_v4.py for documented implementation)
+# -----------------------------
+
+from v4_param_optimized.model import RegisterGPTv4
+
+
+# -----------------------------
+# TRAINING
+# -----------------------------
+
+def main():
+    code = Path(__file__).read_text(encoding="utf-8")
+    args = Hyperparameters()
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "16"))
+    grad_scale = 1.0 / grad_accum_steps
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        dist.barrier()
+    master = rank == 0
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    logfile = None
+    if master:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg, console=True):
+        if not master: return
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        if console: print(line)
+        if logfile:
+            with open(logfile, "a") as f: print(line, file=f)
+
+    log0(code, console=False)
+    log0(f"[init] rank={rank} world_size={world_size} device={device} model_version={args.model_version}")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    log0(f"[init] loading tokenizer from {args.tokenizer_path}")
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    if int(sp.vocab_size()) != args.vocab_size:
+        raise ValueError(f"VOCAB_SIZE mismatch")
+    log0(f"[init] loading validation data from {args.val_files}")
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    bbl, hsl, ibl = build_sentencepiece_luts(sp, args.vocab_size, device)
+    log0(f"[init] data loaded: {val_tokens.numel()} val tokens")
+    log0(f"[init] building model: {args.model_version}")
+
+    if args.model_version == "v1":
+        from v1_shared_attention.model import RegisterGPT as RegisterGPTv1
+        base_model = RegisterGPTv1(
+            vocab_size=args.vocab_size,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            num_steps=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            activation=args.activation,
+        ).to(device).bfloat16()
+    elif args.model_version == "v2":
+        from v2_causal_conv.model import RegisterGPT as RegisterGPTv2
+        base_model = RegisterGPTv2(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            kernel_size=args.kernel_size,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+        ).to(device).bfloat16()
+    elif args.model_version == "wave":
+        from v6_brain_wave.model import BrainWaveGPT
+        band_split = tuple(int(x) for x in args.band_split.split(","))
+        base_model = BrainWaveGPT(
+            vocab_size=args.vocab_size,
+            num_cycles=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            slow_decay_init=args.slow_decay_init,
+            fast_decay_init=args.fast_decay_init,
+            band_split=band_split,
+        ).to(device).bfloat16()
+    elif args.model_version == "v4":
+        base_model = RegisterGPTv4(
+            vocab_size=args.vocab_size,
+            unique_steps=args.unique_steps,
+            invocations_per_step=args.invocations_per_step,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            n_heads=args.n_heads,
+            transform_rank=args.transform_rank,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "gauss":
+        n_freq = args.n_fourier_basis
+        base_model = GaussRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            n_freq=n_freq,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "lgp":
+        from v7_lgp.model import LGPGPT
+        base_model = LGPGPT(
+            vocab_size=args.vocab_size,
+            num_instructions=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            n_ops=args.n_ops,
+            logit_softcap=args.logit_softcap,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "graph":
+        from v8_word_graph.model import WordGraphGPT
+        base_model = WordGraphGPT(
+            vocab_size=args.vocab_size,
+            num_hops=args.num_steps,
+            interaction_rank=args.interaction_rank,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "policy":
+        from v10_policy.model import PolicyGPT
+        base_model = PolicyGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            n_ops=args.n_ops,
+            logit_softcap=args.logit_softcap,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "brainwave":
+        from v11_brainwave.model import BrainWaveGPT as BrainWaveGPTv11
+        base_model = BrainWaveGPTv11(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            gate_dim=args.state_dim,
+            logit_softcap=args.logit_softcap,
+        ).to(device).bfloat16()
+    elif args.model_version == "meta":
+        from v9_meta_state.model import MetaStateGPT
+        base_model = MetaStateGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "sparse":
+        from v12_sparse_register.model import SparseRegisterGPT
+        base_model = SparseRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            k_active=args.k_active,
+            inner_mul=args.inner_mul,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+            parallel_waves=args.parallel_waves,
+            grad_checkpoint=args.grad_checkpoint,
+        ).to(device).bfloat16()
+    elif args.model_version == "tpg":
+        from v11_tpg.model import TPGGPT
+        base_model = TPGGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            tau=args.gumbel_tau,
+            halt_threshold=args.halt_threshold,
+            ponder_lambda=args.ponder_lambda,
+        ).to(device).bfloat16()
+    else:
+        base_model = AssocRegisterLM(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+
+    # Keep small control params in fp32
+    with torch.no_grad():
+        for name, p in base_model.named_parameters():
+            if (p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)) and p.dtype != torch.float32:
+                p.data = p.data.float()
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"[init] model built: {n_params/1e3:.0f}K params on {device}")
+
+    use_compile = bool(int(os.environ.get("TORCH_COMPILE", "0")))
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
+    log0(f"[init] wrapping with DDP (distributed={distributed})")
+    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    log0(f"[init] DDP ready")
+
+    optimizer = torch.optim.Adam(
+        base_model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+    for g in optimizer.param_groups:
+        g["base_lr"] = args.lr
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    n_trainable = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    raw_bytes = sum(p.numel() * p.element_size() for p in base_model.parameters())
+    est_int8_bytes = sum(p.numel() for p in base_model.parameters())  # ~1 byte per param
+    log0(f"run_id:{args.run_id}")
+    log0(f"model_version:{args.model_version}")
+    log0(f"model_params:{n_params} trainable:{n_trainable} vocab=dim={args.vocab_size} raw:{raw_bytes/1e6:.1f}MB est_int8:{est_int8_bytes/1e6:.1f}MB")
+    if args.model_version == "wave":
+        log0(f"architecture:BrainWaveGPT (oscillatory dynamics, cross-frequency coupling)")
+        log0(f"cycles:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis} bands:{args.band_split}")
+        log0(f"slow_decay_init:{args.slow_decay_init} fast_decay_init:{args.fast_decay_init}")
+    elif args.model_version == "v4":
+        log0(f"unique_steps:{args.unique_steps} invocations:{args.invocations_per_step} depth:{args.unique_steps * args.invocations_per_step}")
+        log0(f"channels:{args.n_channels} heads:{args.n_heads} rank:{args.transform_rank} fourier:{args.n_fourier_basis}")
+    else:
+        log0(f"steps:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis}")
+    log0(f"activation:{args.activation} lr:{args.lr} grad_clip:{args.grad_clip_norm} decay_init:{args.decay_init}")
+    log0(f"NO attention. NO embedding. NO output projection.")
+    log0(f"world_size:{world_size} grad_accum:{grad_accum_steps} batch:{args.train_batch_tokens}")
+
+    log0(f"[init] loading training data from {args.train_files}")
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    max_wc_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds else None
+
+    def lr_mul(step, elapsed_ms):
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wc_ms is None:
+            ws = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if ws <= step < args.iterations else 1.0
+        sms = elapsed_ms / max(step, 1)
+        wms = args.warmdown_iters * sms
+        rms = max(max_wc_ms - elapsed_ms, 0.0)
+        return rms / max(wms, 1e-9) if rms <= wms else 1.0
+
+    # Resume from checkpoint if provided
+    start_step = 0
+    if args.resume_from and Path(args.resume_from).exists():
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        if "model" in ckpt and "step" in ckpt:
+            # Full checkpoint (model + optimizer + step)
+            base_model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_step = ckpt["step"]
+            log0(f"resumed checkpoint from {args.resume_from} at step {start_step}")
+        else:
+            # Plain state dict (weights only)
+            base_model.load_state_dict(ckpt, strict=False)
+            log0(f"loaded weights from {args.resume_from} (no optimizer/step, restarting from 0)")
+
+    def save_checkpoint(step):
+        if not master:
+            return
+        ckpt_path = f"logs/{args.run_id}_ckpt.pt"
+        torch.save({
+            "model": base_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+        }, ckpt_path)
+        log0(f"checkpoint:{ckpt_path} step:{step}")
+
+    # Warmup (skip if resuming)
+    log0(f"[init] starting warmup ({args.warmup_steps} steps)")
+    if start_step == 0:
+        for ws in range(args.warmup_steps):
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = model(x, y)
+                (loss * grad_scale).backward()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            optimizer.step()
+            torch.cuda.synchronize()
+            if master and (ws + 1) % 10 == 0 or ws + 1 == args.warmup_steps:
+                log0(f"warmup:{ws + 1}/{args.warmup_steps}")
+
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Training
+    train_ms = 0.0
+    stop_after = None
+    t0 = time.perf_counter()
+    step = start_step
+    while True:
+        last = step == args.iterations or (stop_after is not None and step >= stop_after)
+        if last or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            train_ms += 1000.0 * (time.perf_counter() - t0)
+            vl, vbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"step:{step}/{args.iterations} val_loss:{vl:.4f} val_bpb:{vbpb:.4f} train_time:{train_ms:.0f}ms")
+            t0 = time.perf_counter()
+        if last:
+            if stop_after is not None and step < args.iterations:
+                log0(f"stopping_early: step:{step}/{args.iterations}")
+            break
+
+        lm = lr_mul(step, train_ms + 1000.0 * (time.perf_counter() - t0))
+        for g in optimizer.param_groups:
+            g["lr"] = g["base_lr"] * lm
+
+        step_t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        train_loss_accum = 0.0
+        for _ in range(grad_accum_steps):
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+            (loss * grad_scale).backward()
+            train_loss_accum += loss.item() * grad_scale
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        approx_ms = train_ms + 1000.0 * (time.perf_counter() - t0)
+        step += 1
+        if master and args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0):
+            log0(f"step:{step}/{args.iterations} train_loss:{train_loss_accum:.4f} time:{approx_ms:.0f}ms avg:{approx_ms / step:.1f}ms tok/s:{args.train_batch_tokens / (step_ms / 1000):.0f}")
+        if max_wc_ms and stop_after is None and approx_ms >= max_wc_ms:
+            stop_after = step
+        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            save_checkpoint(step)
+
+    # Final checkpoint
+    save_checkpoint(step)
+
+    # Serialize
+    if master:
+        sd = {k: v for k, v in base_model.state_dict().items()}
+        out = f"logs/{args.run_id}_model.pt"
+        torch.save(sd, out)
+        log0(f"saved:{out} bytes:{Path(out).stat().st_size}")
+
+        qobj, qstats = quantize_state_dict_int8(sd)
+        buf = io.BytesIO()
+        torch.save(qobj, buf)
+        compressed = zlib.compress(buf.getvalue(), 9)
+        qpath = f"logs/{args.run_id}_model.int8.ptz"
+        Path(qpath).write_bytes(compressed)
+        log0(f"quantized:{qpath} bytes:{len(compressed)} ratio:{qstats['baseline_tensor_bytes'] / max(qstats['int8_payload_bytes'], 1):.2f}x")
+
+        if bool(int(os.environ.get("ROUNDTRIP_EVAL", "0"))):
+            dq = dequantize_state_dict_int8(torch.load(io.BytesIO(zlib.decompress(Path(qpath).read_bytes())), weights_only=False))
+            base_model.load_state_dict(dq, strict=False)
+            qvl, qvbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"final_int8_zlib_roundtrip val_loss:{qvl:.4f} val_bpb:{qvbpb:.4f}")
+
+        # Write manifest
+        import json as _json
+        manifest = {
+            "run_id": args.run_id,
+            "model_version": args.model_version,
+            "params": n_params,
+            "trainable": n_trainable,
+            "raw_bytes": raw_bytes,
+            "est_int8_bytes": est_int8_bytes,
+            "quantized_bytes": len(compressed),
+            "vocab_size": args.vocab_size,
+            "num_steps": args.num_steps,
+            "n_channels": getattr(args, "n_channels", None),
+            "n_fourier_basis": getattr(args, "n_fourier_basis", None),
+            "state_dim": getattr(args, "state_dim", None),
+            "inner_dim": getattr(args, "inner_dim", None),
+            "n_ops": getattr(args, "n_ops", None),
+            "lr": args.lr,
+            "activation": args.activation,
+            "decay_init": args.decay_init,
+            "steps_trained": step,
+            "final_train_loss": train_loss_accum if step > start_step else None,
+            "val_loss": vl,
+            "val_bpb": vbpb,
+            "train_time_ms": train_ms,
+            "world_size": world_size,
+            "grad_accum_steps": grad_accum_steps,
+            "batch_tokens": args.train_batch_tokens,
+            "model_path": out,
+            "quantized_path": qpath,
+        }
+        manifest_path = f"logs/{args.run_id}_manifest.json"
+        with open(manifest_path, "w") as f:
+            _json.dump(manifest, f, indent=2)
+        log0(f"manifest:{manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+[20:49:40] [init] rank=0 world_size=3 device=cuda:0 model_version=meta
+[20:49:40] [init] loading tokenizer from ./data/tokenizers/fineweb_1024_bpe.model
+[20:49:40] [init] loading validation data from ./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin
+[20:49:41] [init] data loaded: 62021633 val tokens
+[20:49:41] [init] building model: meta
+[20:49:41] [init] model built: 4195K params on cuda:0
+[20:49:41] [init] wrapping with DDP (distributed=True)
+[20:55:22] """
+RegisterGPT v3 — Register machine with associative memory, PyTorch/CUDA training.
+Outer-product memory for cross-position mixing. Fourier ops for within-position transforms.
+No attention. No embedding. No output projection.
+Compatible with torchrun for multi-GPU training.
+"""
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from pydantic import Field, computed_field
+from pydantic_settings import BaseSettings
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# -----------------------------
+# HYPERPARAMETERS
+# -----------------------------
+
+
+class DataConfig(BaseSettings):
+    data_path: str = "./data/datasets/fineweb10B_sp1024"
+    tokenizer_path: str = "./data/tokenizers/fineweb_1024_bpe.model"
+
+    @computed_field
+    @property
+    def train_files(self) -> str:
+        return os.path.join(self.data_path, "fineweb_train_*.bin")
+
+    @computed_field
+    @property
+    def val_files(self) -> str:
+        return os.path.join(self.data_path, "fineweb_val_*.bin")
+
+
+class RunConfig(BaseSettings):
+    run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    resume_from: str = Field("", validation_alias="RESUME")
+    checkpoint_every: int = 500
+    seed: int = 1337
+
+
+class ScheduleConfig(BaseSettings):
+    val_batch_size: int = 524_288
+    val_loss_every: int = 1000
+    train_log_every: int = 200
+    iterations: int = 500
+    warmdown_iters: int = 1200
+    warmup_steps: int = 20
+    train_batch_tokens: int = 524_288
+    train_seq_len: int = 1024
+    max_wallclock_seconds: Optional[float] = None
+
+
+class ModelCommonConfig(BaseSettings):
+    model_version: str = "v3"
+    vocab_size: int = 1024
+    num_steps: int = 8
+    n_fourier_basis: int = 16
+    n_channels: int = 128
+    activation: str = "gelu"
+    logit_softcap: float = 30.0
+    decay_init: float = 3.0
+
+
+class V1Config(BaseSettings):
+    num_heads: int = 8
+    num_kv_heads: int = 4
+    rope_base: float = 10000.0
+    qk_gain_init: float = 1.5
+
+
+class V2Config(BaseSettings):
+    kernel_size: int = 16
+
+
+class V4Config(BaseSettings):
+    n_heads: int = 4
+    transform_rank: int = 8
+    unique_steps: int = 5
+    invocations_per_step: int = 2
+
+
+class WaveConfig(BaseSettings):
+    slow_decay_init: float = 4.0
+    fast_decay_init: float = 2.0
+    band_split: str = "4,4,8"
+
+
+class LgpConfig(BaseSettings):
+    n_ops: int = 8
+
+
+class GraphConfig(BaseSettings):
+    interaction_rank: int = 64
+
+
+class MetaStateConfig(BaseSettings):
+    state_dim: int = 64
+    inner_dim: int = 128
+
+
+class TpgConfig(BaseSettings):
+    gumbel_tau: float = 1.0
+    halt_threshold: float = 0.5
+    ponder_lambda: float = 0.01
+
+
+class SparseRegisterConfig(BaseSettings):
+    k_active: int = 256
+    inner_mul: int = 2
+    parallel_waves: bool = True
+    grad_checkpoint: bool = False
+
+
+class OptimizerConfig(BaseSettings):
+    lr: float = 0.03
+    beta1: float = 0.9
+    beta2: float = 0.999
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.0
+    grad_clip_norm: float = 1.0
+
+
+class Hyperparameters:
+    def __init__(self) -> None:
+        self.data = DataConfig()
+        self.run = RunConfig()
+        self.schedule = ScheduleConfig()
+        self.model_common = ModelCommonConfig()
+        self.v1 = V1Config()
+        self.v2 = V2Config()
+        self.v4 = V4Config()
+        self.wave = WaveConfig()
+        self.lgp = LgpConfig()
+        self.graph = GraphConfig()
+        self.meta = MetaStateConfig()
+        self.tpg = TpgConfig()
+        self.sparse = SparseRegisterConfig()
+        self.optimizer = OptimizerConfig()
+        self._groups = [
+            self.data, self.run, self.schedule, self.model_common,
+            self.v1, self.v2, self.v4, self.wave, self.lgp,
+            self.graph, self.meta, self.tpg, self.sparse, self.optimizer,
+        ]
+
+    def __getattr__(self, name: str):
+        for group in self._groups:
+            try:
+                return getattr(group, name)
+            except AttributeError:
+                continue
+        raise AttributeError(f"Hyperparameters has no field {name!r}")
+
+
+# Patterns for control tensors (kept in float32)
+CONTROL_TENSOR_NAME_PATTERNS = (
+    "mem_scale", "op_scale", "read_coeffs", "write_coeffs",
+    "channel_mix", "bias", "out_scale", "logit_scale", "decay_logit",
+    "coeffs",
+    # v4 additions
+    "diag", "mix_down", "mix_up", "decay_logits", "_override",
+    # gauss additions
+    "freq_to_ch", "ch_to_freq", "weight",
+    # lgp additions
+    "op_logits", "op_weights", "op_biases",
+    # graph additions
+    "q_scale", "k_scale", "diag", "prop_scale", "interact_scale",
+    # tpg additions
+    "halt_proj", "act_selector", "scale_gate", "t_scale",
+    # sparse register additions (v12)
+    "mem_scale", "write_scale", "mlp_bias",
+)
+
+# -----------------------------
+# VALIDATION + QUANTIZATION
+# -----------------------------
+
+def build_sentencepiece_luts(sp, vocab_size, device):
+    sv = int(sp.vocab_size())
+    ts = max(sv, vocab_size)
+    bb = np.zeros((ts,), dtype=np.int16)
+    hs = np.zeros((ts,), dtype=np.bool_)
+    ib = np.ones((ts,), dtype=np.bool_)
+    for tid in range(sv):
+        if sp.is_control(tid) or sp.is_unknown(tid) or sp.is_unused(tid):
+            continue
+        ib[tid] = False
+        if sp.is_byte(tid):
+            bb[tid] = 1
+            continue
+        piece = sp.id_to_piece(tid)
+        if piece.startswith("▁"):
+            hs[tid] = True
+            piece = piece[1:]
+        bb[tid] = len(piece.encode("utf-8"))
+    return (torch.tensor(bb, dtype=torch.int16, device=device),
+            torch.tensor(hs, dtype=torch.bool, device=device),
+            torch.tensor(ib, dtype=torch.bool, device=device))
+
+
+def load_data_shard(file):
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Bad header: {file}")
+    n = int(header[2])
+    tokens = np.fromfile(file, dtype="<u2", count=n, offset=256 * 4)
+    return torch.from_numpy(tokens.astype(np.uint16, copy=False))
+
+
+def load_validation_tokens(pattern, seq_len):
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files: {pattern}")
+    tokens = torch.cat([load_data_shard(f) for f in files]).contiguous()
+    usable = ((tokens.numel() - 1) // seq_len) * seq_len
+    return tokens[:usable + 1]
+
+
+class TokenStream:
+    def __init__(self, pattern):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files: {pattern}")
+        self.file_idx = 0
+        self.tokens = load_data_shard(self.files[0])
+        self.pos = 0
+
+    def _advance(self):
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = 0
+
+    def take(self, n):
+        chunks = []
+        left = n
+        while left > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance()
+                continue
+            k = min(left, avail)
+            chunks.append(self.tokens[self.pos:self.pos + k])
+            self.pos += k
+            left -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedTokenLoader:
+    def __init__(self, pattern, rank, world_size, device):
+        self.rank, self.world_size, self.device = rank, world_size, device
+        self.stream = TokenStream(pattern)
+
+    def next_batch(self, global_tokens, seq_len, grad_accum_steps):
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        span = local_tokens + 1
+        chunk = self.stream.take(span * self.world_size)
+        start = self.rank * span
+        local = chunk[start:start + span].to(dtype=torch.int64)
+        x, y = local[:-1].reshape(-1, seq_len), local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+def eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl):
+    lbt = args.val_batch_size // (world_size * grad_accum_steps)
+    if lbt < args.train_seq_len:
+        raise ValueError("VAL_BATCH_SIZE too small")
+    lbs = lbt // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    ss, se = (total_seqs * rank) // world_size, (total_seqs * (rank + 1)) // world_size
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    tok_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    model.eval()
+    with torch.inference_mode():
+        for bs in range(ss, se, lbs):
+            be = min(bs + lbs, se)
+            local = val_tokens[bs * args.train_seq_len:be * args.train_seq_len + 1].to(device=device, dtype=torch.int64)
+            x, y = local[:-1].reshape(-1, args.train_seq_len), local[1:].reshape(-1, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                bl = model(x, y).detach()
+            ct = float(y.numel())
+            loss_sum += bl.to(torch.float64) * ct
+            tok_count += ct
+            tb = bbl[y.reshape(-1)].to(torch.float64)
+            tb += (hsl[y.reshape(-1)] & ~ibl[x.reshape(-1)]).to(torch.float64)
+            byte_count += tb.sum()
+    if dist.is_available() and dist.is_initialized():
+        for t in (loss_sum, tok_count, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    vl = (loss_sum / tok_count).item()
+    model.train()
+    return vl, vl / math.log(2.0) * (tok_count.item() / byte_count.item())
+
+
+INT8_CLIP_Q = 99.99984 / 100.0
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+
+def quantize_state_dict_int8(sd):
+    quantized, scales, dtypes, passthrough = {}, {}, {}, {}
+    passthrough_orig_dtypes, qmeta = {}, {}
+    stats = dict.fromkeys(("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0)
+    for name, tensor in sd.items():
+        t = tensor.detach().cpu().contiguous()
+        stats["param_count"] += t.numel()
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += t.numel() * t.element_size()
+        if not t.is_floating_point():
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += t.numel() * t.element_size()
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+                kept = t.float().contiguous()
+            elif t.dtype in {torch.float32, torch.bfloat16}:
+                passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+                kept = t.to(torch.float16).contiguous()
+            else:
+                kept = t
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += kept.numel() * kept.element_size()
+            continue
+        stats["num_float_tensors"] += 1
+        t32 = t.float()
+        if t32.ndim == 2:
+            ca = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            clipped = torch.clamp(t32, -ca[:, None], ca[:, None])
+            s = (ca / 127.0).clamp_min(1.0 / 127.0)
+            q = torch.clamp(torch.round(clipped / s[:, None]), -127, 127).to(torch.int8)
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            scales[name] = s.to(torch.float16).contiguous()
+        else:
+            ca = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+            s = torch.tensor(ca / 127.0 if ca > 0 else 1.0, dtype=torch.float32)
+            q = torch.clamp(torch.round(torch.clamp(t32, -ca, ca) / s), -127, 127).to(torch.int8)
+            scales[name] = s
+        quantized[name] = q.contiguous()
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += q.numel() + (scales[name].numel() * scales[name].element_size())
+    obj = {"__quant_format__": "int8_clean_per_row_v1", "quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
+    if qmeta: obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes: obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_int8(obj):
+    out = {}
+    qmeta = obj.get("qmeta", {})
+    pod = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dt = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name].to(torch.float32)
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dt)
+        else:
+            out[name] = (q.float() * s.item()).to(dt)
+    for name, t in obj["passthrough"].items():
+        od = pod.get(name)
+        out[name] = t.to(getattr(torch, od)) if isinstance(od, str) else t.detach().cpu()
+    return out
+
+
+# -----------------------------
+# MODEL
+# -----------------------------
+
+def apply_activation(x, activation):
+    if activation == "gelu":
+        return F.gelu(x)
+    elif activation == "relu2":
+        return F.relu(x).square()
+    elif activation == "swish":
+        return F.silu(x)
+    return F.gelu(x)
+
+
+class FourierProjection(nn.Module):
+    """Project vocab-space to channels via Fourier basis coefficients."""
+    def __init__(self, n_basis, n_channels, soft=False):
+        super().__init__()
+        self.soft = soft
+        self.coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * 0.02)
+
+    def forward(self, basis):
+        w = basis @ self.coeffs.T
+        if self.soft:
+            w = torch.softmax(w, dim=0)
+        return w
+
+
+class AssociativeMemoryStep(nn.Module):
+    """Cross-position mixing via causal decay-weighted associative memory (parallel)."""
+    def __init__(self, n_basis, n_channels, decay_init=3.0):
+        super().__init__()
+        self.n_channels = n_channels
+        self.query_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.key_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.value_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.output_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        B, T, V = x.shape
+        dtype = x.dtype
+
+        q_w = self.query_proj(basis).to(dtype)
+        k_w = self.key_proj(basis).to(dtype)
+        v_w = self.value_proj(basis).to(dtype)
+        o_w = self.output_proj(basis).to(dtype)
+
+        queries = x @ q_w
+        keys = x @ k_w
+        values = x @ v_w
+
+        # Content similarity in channel space
+        scores = torch.bmm(queries, keys.transpose(1, 2))  # (B, T, T)
+
+        # Causal decay mask: decay^(t-s-1) for s < t, 0 otherwise
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)  # (T, T)
+        causal_mask = (diff > 0)
+        decay_weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal_mask
+        scores = scores * decay_weights.to(dtype).unsqueeze(0)
+
+        # Retrieve: weighted sum of values
+        retrieved = torch.bmm(scores, values)  # (B, T, C)
+
+        return retrieved @ o_w.T * self.out_scale.to(dtype)
+
+
+class FourierRegisterOp(nn.Module):
+    """Within-position register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu"):
+        super().__init__()
+        self.activation = activation
+        s = 0.02
+        self.read_coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * s)
+        self.write_coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * s)
+        self.channel_mix = nn.Parameter(torch.randn(n_channels, n_channels) * s)
+        self.bias = nn.Parameter(torch.zeros(n_channels))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        read_p = torch.softmax(basis @ self.read_coeffs.T, dim=0).to(x.dtype)
+        values = x @ read_p
+        values = values @ self.channel_mix.to(x.dtype) + self.bias.to(x.dtype)
+        values = apply_activation(values, self.activation)
+        write_p = (basis @ self.write_coeffs.T).to(x.dtype)
+        return values @ write_p.T * self.out_scale.to(x.dtype)
+
+
+class RegisterStep(nn.Module):
+    """One LGP instruction: memory read/write + register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.memory = AssociativeMemoryStep(n_basis, n_channels, decay_init)
+        self.register_op = FourierRegisterOp(n_basis, n_channels, activation)
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x, basis):
+        D = x.size(-1)
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)), basis)
+        x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)), basis)
+        return x
+
+
+class AssocRegisterLM(nn.Module):
+    """Register machine with associative memory. No attention. No embedding."""
+    def __init__(self, vocab_size, num_steps, n_fourier_basis, n_channels,
+                 logit_softcap, activation="gelu", decay_init=0.95):
+        super().__init__()
+        dim = vocab_size
+        self.vocab_size = vocab_size
+        self.num_steps = num_steps
+        self.logit_softcap = logit_softcap
+
+        self.steps = nn.ModuleList([
+            RegisterStep(n_fourier_basis, n_channels, activation, decay_init)
+            for _ in range(num_steps)
+        ])
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+        positions = torch.arange(dim, dtype=torch.float32) / dim
+        basis = torch.zeros(dim, 2 * n_fourier_basis)
+        for k in range(n_fourier_basis):
+            basis[:, 2 * k] = torch.cos(2 * math.pi * (k + 1) * positions)
+            basis[:, 2 * k + 1] = torch.sin(2 * math.pi * (k + 1) * positions)
+        self.register_buffer("fourier_basis", basis, persistent=True)
+
+    def forward(self, input_ids, target_ids):
+        V = self.vocab_size
+        x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
+        x = F.rms_norm(x, (V,))
+        basis = self.fourier_basis
+
+        for step in self.steps:
+            x = step(x, basis)
+
+        x = F.rms_norm(x, (V,))
+        logits = x * self.logit_scale.to(x.dtype)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="mean")
+
+
+# -----------------------------
+# GAUSS MODEL (FFT-based)
+# -----------------------------
+
+class GaussProjection(nn.Module):
+    """Project vocab-space to channels via FFT."""
+    def __init__(self, n_freq, n_channels):
+        super().__init__()
+        self.n_freq = n_freq
+        self.weight = nn.Parameter(torch.randn(n_channels, 2 * n_freq) * 0.02)
+
+    def forward(self, x):
+        X = torch.fft.rfft(x.float(), dim=-1)
+        X = X[..., 1:self.n_freq + 1]
+        X_ri = torch.cat([X.real, X.imag], dim=-1)
+        return (X_ri @ self.weight.T).to(x.dtype)
+
+
+class GaussSynthesis(nn.Module):
+    """Project channels back to vocab-space via IFFT."""
+    def __init__(self, n_freq, n_channels, vocab_size):
+        super().__init__()
+        self.n_freq = n_freq
+        self.vocab_size = vocab_size
+        self.weight = nn.Parameter(torch.randn(2 * n_freq, n_channels) * 0.02)
+
+    def forward(self, h):
+        n, V = self.n_freq, self.vocab_size
+        Y_ri = h.float() @ self.weight
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
+        shape = list(h.shape[:-1]) + [V // 2 + 1]
+        full = torch.zeros(shape, dtype=Y.dtype, device=h.device)
+        full[..., 1:n + 1] = Y
+        return torch.fft.irfft(full, n=V, dim=-1).to(h.dtype)
+
+
+class GaussMemoryStep(nn.Module):
+    """Cross-position mixing via FFT projections + causal decay memory."""
+    def __init__(self, n_freq, n_channels, vocab_size, decay_init=3.0):
+        super().__init__()
+        self.n_channels = n_channels
+        self.q_proj = GaussProjection(n_freq, n_channels)
+        self.k_proj = GaussProjection(n_freq, n_channels)
+        self.v_proj = GaussProjection(n_freq, n_channels)
+        self.o_proj = GaussSynthesis(n_freq, n_channels, vocab_size)
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        B, T, V = x.shape
+        dtype = x.dtype
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        scores = torch.bmm(queries, keys.transpose(1, 2))
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+        causal = (diff > 0)
+        weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal
+        scores = scores * weights.to(dtype).unsqueeze(0)
+        retrieved = torch.bmm(scores, values)
+        return self.o_proj(retrieved) * self.out_scale.to(dtype)
+
+
+class GaussRegisterOp(nn.Module):
+    """Within-position transform via FFT → channels → IFFT."""
+    def __init__(self, n_freq, n_channels, vocab_size, activation="gelu"):
+        super().__init__()
+        self.activation = activation
+        self.n_freq = n_freq
+        self.vocab_size = vocab_size
+        s = 0.02
+        self.freq_to_ch = nn.Parameter(torch.randn(n_channels, 2 * n_freq) * s)
+        self.channel_mix = nn.Parameter(torch.randn(n_channels, n_channels) * s)
+        self.bias = nn.Parameter(torch.zeros(n_channels))
+        self.ch_to_freq = nn.Parameter(torch.randn(2 * n_freq, n_channels) * s)
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        B, T, V = x.shape
+        dtype = x.dtype
+        n = self.n_freq
+        X = torch.fft.rfft(x.float(), dim=-1)
+        X = X[..., 1:n + 1]
+        X_ri = torch.cat([X.real, X.imag], dim=-1)
+        h = X_ri @ self.freq_to_ch.T
+        h = h @ self.channel_mix + self.bias
+        h = apply_activation(h, self.activation)
+        Y_ri = h @ self.ch_to_freq.T
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
+        full = torch.zeros(B, T, V // 2 + 1, dtype=Y.dtype, device=x.device)
+        full[..., 1:n + 1] = Y
+        return torch.fft.irfft(full, n=V, dim=-1).to(dtype) * self.out_scale.to(dtype)
+
+
+class GaussRegisterStep(nn.Module):
+    """One step: FFT memory + FFT register op."""
+    def __init__(self, n_freq, n_channels, vocab_size, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.memory = GaussMemoryStep(n_freq, n_channels, vocab_size, decay_init)
+        self.register_op = GaussRegisterOp(n_freq, n_channels, vocab_size, activation)
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        D = x.size(-1)
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)))
+        x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)))
+        return x
+
+
+class GaussRegisterGPT(nn.Module):
+    """Register machine with FFT-based operations. No stored Fourier basis."""
+    def __init__(self, vocab_size, num_steps, n_freq, n_channels,
+                 logit_softcap, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.num_steps = num_steps
+        self.logit_softcap = logit_softcap
+        self.steps = nn.ModuleList([
+            GaussRegisterStep(n_freq, n_channels, vocab_size, activation, decay_init)
+            for _ in range(num_steps)
+        ])
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, input_ids, target_ids):
+        V = self.vocab_size
+        x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
+        x = F.rms_norm(x, (V,))
+        for step in self.steps:
+            x = step(x)
+        x = F.rms_norm(x, (V,))
+        logits = x * self.logit_scale.to(x.dtype)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="mean")
+
+
+# -----------------------------
+# V4 MODEL (param-optimized, see model_v4.py for documented implementation)
+# -----------------------------
+
+from v4_param_optimized.model import RegisterGPTv4
+
+
+# -----------------------------
+# TRAINING
+# -----------------------------
+
+def main():
+    code = Path(__file__).read_text(encoding="utf-8")
+    args = Hyperparameters()
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "16"))
+    grad_scale = 1.0 / grad_accum_steps
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        dist.barrier()
+    master = rank == 0
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    logfile = None
+    if master:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg, console=True):
+        if not master: return
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        if console: print(line)
+        if logfile:
+            with open(logfile, "a") as f: print(line, file=f)
+
+    log0(code, console=False)
+    log0(f"[init] rank={rank} world_size={world_size} device={device} model_version={args.model_version}")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    log0(f"[init] loading tokenizer from {args.tokenizer_path}")
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    if int(sp.vocab_size()) != args.vocab_size:
+        raise ValueError(f"VOCAB_SIZE mismatch")
+    log0(f"[init] loading validation data from {args.val_files}")
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    bbl, hsl, ibl = build_sentencepiece_luts(sp, args.vocab_size, device)
+    log0(f"[init] data loaded: {val_tokens.numel()} val tokens")
+    log0(f"[init] building model: {args.model_version}")
+
+    if args.model_version == "v1":
+        from v1_shared_attention.model import RegisterGPT as RegisterGPTv1
+        base_model = RegisterGPTv1(
+            vocab_size=args.vocab_size,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            num_steps=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            activation=args.activation,
+        ).to(device).bfloat16()
+    elif args.model_version == "v2":
+        from v2_causal_conv.model import RegisterGPT as RegisterGPTv2
+        base_model = RegisterGPTv2(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            kernel_size=args.kernel_size,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+        ).to(device).bfloat16()
+    elif args.model_version == "wave":
+        from v6_brain_wave.model import BrainWaveGPT
+        band_split = tuple(int(x) for x in args.band_split.split(","))
+        base_model = BrainWaveGPT(
+            vocab_size=args.vocab_size,
+            num_cycles=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            slow_decay_init=args.slow_decay_init,
+            fast_decay_init=args.fast_decay_init,
+            band_split=band_split,
+        ).to(device).bfloat16()
+    elif args.model_version == "v4":
+        base_model = RegisterGPTv4(
+            vocab_size=args.vocab_size,
+            unique_steps=args.unique_steps,
+            invocations_per_step=args.invocations_per_step,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            n_heads=args.n_heads,
+            transform_rank=args.transform_rank,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "gauss":
+        n_freq = args.n_fourier_basis
+        base_model = GaussRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            n_freq=n_freq,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "lgp":
+        from v7_lgp.model import LGPGPT
+        base_model = LGPGPT(
+            vocab_size=args.vocab_size,
+            num_instructions=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            n_ops=args.n_ops,
+            logit_softcap=args.logit_softcap,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "graph":
+        from v8_word_graph.model import WordGraphGPT
+        base_model = WordGraphGPT(
+            vocab_size=args.vocab_size,
+            num_hops=args.num_steps,
+            interaction_rank=args.interaction_rank,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "policy":
+        from v10_policy.model import PolicyGPT
+        base_model = PolicyGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            n_ops=args.n_ops,
+            logit_softcap=args.logit_softcap,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "brainwave":
+        from v11_brainwave.model import BrainWaveGPT as BrainWaveGPTv11
+        base_model = BrainWaveGPTv11(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            gate_dim=args.state_dim,
+            logit_softcap=args.logit_softcap,
+        ).to(device).bfloat16()
+    elif args.model_version == "meta":
+        from v9_meta_state.model import MetaStateGPT
+        base_model = MetaStateGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "sparse":
+        from v12_sparse_register.model import SparseRegisterGPT
+        base_model = SparseRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            k_active=args.k_active,
+            inner_mul=args.inner_mul,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+            parallel_waves=args.parallel_waves,
+            grad_checkpoint=args.grad_checkpoint,
+        ).to(device).bfloat16()
+    elif args.model_version == "tpg":
+        from v11_tpg.model import TPGGPT
+        base_model = TPGGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            tau=args.gumbel_tau,
+            halt_threshold=args.halt_threshold,
+            ponder_lambda=args.ponder_lambda,
+        ).to(device).bfloat16()
+    else:
+        base_model = AssocRegisterLM(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+
+    # Keep small control params in fp32
+    with torch.no_grad():
+        for name, p in base_model.named_parameters():
+            if (p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)) and p.dtype != torch.float32:
+                p.data = p.data.float()
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"[init] model built: {n_params/1e3:.0f}K params on {device}")
+
+    use_compile = bool(int(os.environ.get("TORCH_COMPILE", "0")))
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
+    if distributed:
+        print(f"[rank {rank}] reached DDP barrier", flush=True)
+        dist.barrier()
+        print(f"[rank {rank}] passed DDP barrier, calling DDP()", flush=True)
+    log0(f"[init] wrapping with DDP (distributed={distributed})")
+    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    log0(f"[init] DDP ready")
+
+    optimizer = torch.optim.Adam(
+        base_model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+    for g in optimizer.param_groups:
+        g["base_lr"] = args.lr
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    n_trainable = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    raw_bytes = sum(p.numel() * p.element_size() for p in base_model.parameters())
+    est_int8_bytes = sum(p.numel() for p in base_model.parameters())  # ~1 byte per param
+    log0(f"run_id:{args.run_id}")
+    log0(f"model_version:{args.model_version}")
+    log0(f"model_params:{n_params} trainable:{n_trainable} vocab=dim={args.vocab_size} raw:{raw_bytes/1e6:.1f}MB est_int8:{est_int8_bytes/1e6:.1f}MB")
+    if args.model_version == "wave":
+        log0(f"architecture:BrainWaveGPT (oscillatory dynamics, cross-frequency coupling)")
+        log0(f"cycles:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis} bands:{args.band_split}")
+        log0(f"slow_decay_init:{args.slow_decay_init} fast_decay_init:{args.fast_decay_init}")
+    elif args.model_version == "v4":
+        log0(f"unique_steps:{args.unique_steps} invocations:{args.invocations_per_step} depth:{args.unique_steps * args.invocations_per_step}")
+        log0(f"channels:{args.n_channels} heads:{args.n_heads} rank:{args.transform_rank} fourier:{args.n_fourier_basis}")
+    else:
+        log0(f"steps:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis}")
+    log0(f"activation:{args.activation} lr:{args.lr} grad_clip:{args.grad_clip_norm} decay_init:{args.decay_init}")
+    log0(f"NO attention. NO embedding. NO output projection.")
+    log0(f"world_size:{world_size} grad_accum:{grad_accum_steps} batch:{args.train_batch_tokens}")
+
+    log0(f"[init] loading training data from {args.train_files}")
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    max_wc_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds else None
+
+    def lr_mul(step, elapsed_ms):
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wc_ms is None:
+            ws = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if ws <= step < args.iterations else 1.0
+        sms = elapsed_ms / max(step, 1)
+        wms = args.warmdown_iters * sms
+        rms = max(max_wc_ms - elapsed_ms, 0.0)
+        return rms / max(wms, 1e-9) if rms <= wms else 1.0
+
+    # Resume from checkpoint if provided
+    start_step = 0
+    if args.resume_from and Path(args.resume_from).exists():
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        if "model" in ckpt and "step" in ckpt:
+            # Full checkpoint (model + optimizer + step)
+            base_model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_step = ckpt["step"]
+            log0(f"resumed checkpoint from {args.resume_from} at step {start_step}")
+        else:
+            # Plain state dict (weights only)
+            base_model.load_state_dict(ckpt, strict=False)
+            log0(f"loaded weights from {args.resume_from} (no optimizer/step, restarting from 0)")
+
+    def save_checkpoint(step):
+        if not master:
+            return
+        ckpt_path = f"logs/{args.run_id}_ckpt.pt"
+        torch.save({
+            "model": base_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+        }, ckpt_path)
+        log0(f"checkpoint:{ckpt_path} step:{step}")
+
+    # Warmup (skip if resuming)
+    log0(f"[init] starting warmup ({args.warmup_steps} steps)")
+    if start_step == 0:
+        for ws in range(args.warmup_steps):
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = model(x, y)
+                (loss * grad_scale).backward()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            optimizer.step()
+            torch.cuda.synchronize()
+            if master and (ws + 1) % 10 == 0 or ws + 1 == args.warmup_steps:
+                log0(f"warmup:{ws + 1}/{args.warmup_steps}")
+
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Training
+    train_ms = 0.0
+    stop_after = None
+    t0 = time.perf_counter()
+    step = start_step
+    while True:
+        last = step == args.iterations or (stop_after is not None and step >= stop_after)
+        if last or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            train_ms += 1000.0 * (time.perf_counter() - t0)
+            vl, vbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"step:{step}/{args.iterations} val_loss:{vl:.4f} val_bpb:{vbpb:.4f} train_time:{train_ms:.0f}ms")
+            t0 = time.perf_counter()
+        if last:
+            if stop_after is not None and step < args.iterations:
+                log0(f"stopping_early: step:{step}/{args.iterations}")
+            break
+
+        lm = lr_mul(step, train_ms + 1000.0 * (time.perf_counter() - t0))
+        for g in optimizer.param_groups:
+            g["lr"] = g["base_lr"] * lm
+
+        step_t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        train_loss_accum = 0.0
+        for _ in range(grad_accum_steps):
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+            (loss * grad_scale).backward()
+            train_loss_accum += loss.item() * grad_scale
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        approx_ms = train_ms + 1000.0 * (time.perf_counter() - t0)
+        step += 1
+        if master and args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0):
+            log0(f"step:{step}/{args.iterations} train_loss:{train_loss_accum:.4f} time:{approx_ms:.0f}ms avg:{approx_ms / step:.1f}ms tok/s:{args.train_batch_tokens / (step_ms / 1000):.0f}")
+        if max_wc_ms and stop_after is None and approx_ms >= max_wc_ms:
+            stop_after = step
+        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            save_checkpoint(step)
+
+    # Final checkpoint
+    save_checkpoint(step)
+
+    # Serialize
+    if master:
+        sd = {k: v for k, v in base_model.state_dict().items()}
+        out = f"logs/{args.run_id}_model.pt"
+        torch.save(sd, out)
+        log0(f"saved:{out} bytes:{Path(out).stat().st_size}")
+
+        qobj, qstats = quantize_state_dict_int8(sd)
+        buf = io.BytesIO()
+        torch.save(qobj, buf)
+        compressed = zlib.compress(buf.getvalue(), 9)
+        qpath = f"logs/{args.run_id}_model.int8.ptz"
+        Path(qpath).write_bytes(compressed)
+        log0(f"quantized:{qpath} bytes:{len(compressed)} ratio:{qstats['baseline_tensor_bytes'] / max(qstats['int8_payload_bytes'], 1):.2f}x")
+
+        if bool(int(os.environ.get("ROUNDTRIP_EVAL", "0"))):
+            dq = dequantize_state_dict_int8(torch.load(io.BytesIO(zlib.decompress(Path(qpath).read_bytes())), weights_only=False))
+            base_model.load_state_dict(dq, strict=False)
+            qvl, qvbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"final_int8_zlib_roundtrip val_loss:{qvl:.4f} val_bpb:{qvbpb:.4f}")
+
+        # Write manifest
+        import json as _json
+        manifest = {
+            "run_id": args.run_id,
+            "model_version": args.model_version,
+            "params": n_params,
+            "trainable": n_trainable,
+            "raw_bytes": raw_bytes,
+            "est_int8_bytes": est_int8_bytes,
+            "quantized_bytes": len(compressed),
+            "vocab_size": args.vocab_size,
+            "num_steps": args.num_steps,
+            "n_channels": getattr(args, "n_channels", None),
+            "n_fourier_basis": getattr(args, "n_fourier_basis", None),
+            "state_dim": getattr(args, "state_dim", None),
+            "inner_dim": getattr(args, "inner_dim", None),
+            "n_ops": getattr(args, "n_ops", None),
+            "lr": args.lr,
+            "activation": args.activation,
+            "decay_init": args.decay_init,
+            "steps_trained": step,
+            "final_train_loss": train_loss_accum if step > start_step else None,
+            "val_loss": vl,
+            "val_bpb": vbpb,
+            "train_time_ms": train_ms,
+            "world_size": world_size,
+            "grad_accum_steps": grad_accum_steps,
+            "batch_tokens": args.train_batch_tokens,
+            "model_path": out,
+            "quantized_path": qpath,
+        }
+        manifest_path = f"logs/{args.run_id}_manifest.json"
+        with open(manifest_path, "w") as f:
+            _json.dump(manifest, f, indent=2)
+        log0(f"manifest:{manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+[20:55:22] [init] rank=0 world_size=3 device=cuda:0 model_version=v3
+[20:55:22] [init] loading tokenizer from ./data/tokenizers/fineweb_1024_bpe.model
+[20:55:22] [init] loading validation data from ./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin
+[20:55:22] [init] data loaded: 62021633 val tokens
+[20:55:22] [init] building model: v3
+[20:55:22] [init] model built: 329K params on cuda:0
+[20:57:18] """
+RegisterGPT v3 — Register machine with associative memory, PyTorch/CUDA training.
+Outer-product memory for cross-position mixing. Fourier ops for within-position transforms.
+No attention. No embedding. No output projection.
+Compatible with torchrun for multi-GPU training.
+"""
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from pydantic import Field, computed_field
+from pydantic_settings import BaseSettings
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# -----------------------------
+# HYPERPARAMETERS
+# -----------------------------
+
+
+class DataConfig(BaseSettings):
+    data_path: str = "./data/datasets/fineweb10B_sp1024"
+    tokenizer_path: str = "./data/tokenizers/fineweb_1024_bpe.model"
+
+    @computed_field
+    @property
+    def train_files(self) -> str:
+        return os.path.join(self.data_path, "fineweb_train_*.bin")
+
+    @computed_field
+    @property
+    def val_files(self) -> str:
+        return os.path.join(self.data_path, "fineweb_val_*.bin")
+
+
+class RunConfig(BaseSettings):
+    run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    resume_from: str = Field("", validation_alias="RESUME")
+    checkpoint_every: int = 500
+    seed: int = 1337
+
+
+class ScheduleConfig(BaseSettings):
+    val_batch_size: int = 524_288
+    val_loss_every: int = 1000
+    train_log_every: int = 200
+    iterations: int = 500
+    warmdown_iters: int = 1200
+    warmup_steps: int = 20
+    train_batch_tokens: int = 524_288
+    train_seq_len: int = 1024
+    max_wallclock_seconds: Optional[float] = None
+
+
+class ModelCommonConfig(BaseSettings):
+    model_version: str = "v3"
+    vocab_size: int = 1024
+    num_steps: int = 8
+    n_fourier_basis: int = 16
+    n_channels: int = 128
+    activation: str = "gelu"
+    logit_softcap: float = 30.0
+    decay_init: float = 3.0
+
+
+class V1Config(BaseSettings):
+    num_heads: int = 8
+    num_kv_heads: int = 4
+    rope_base: float = 10000.0
+    qk_gain_init: float = 1.5
+
+
+class V2Config(BaseSettings):
+    kernel_size: int = 16
+
+
+class V4Config(BaseSettings):
+    n_heads: int = 4
+    transform_rank: int = 8
+    unique_steps: int = 5
+    invocations_per_step: int = 2
+
+
+class WaveConfig(BaseSettings):
+    slow_decay_init: float = 4.0
+    fast_decay_init: float = 2.0
+    band_split: str = "4,4,8"
+
+
+class LgpConfig(BaseSettings):
+    n_ops: int = 8
+
+
+class GraphConfig(BaseSettings):
+    interaction_rank: int = 64
+
+
+class MetaStateConfig(BaseSettings):
+    state_dim: int = 64
+    inner_dim: int = 128
+
+
+class TpgConfig(BaseSettings):
+    gumbel_tau: float = 1.0
+    halt_threshold: float = 0.5
+    ponder_lambda: float = 0.01
+
+
+class SparseRegisterConfig(BaseSettings):
+    k_active: int = 256
+    inner_mul: int = 2
+    parallel_waves: bool = True
+    grad_checkpoint: bool = False
+
+
+class OptimizerConfig(BaseSettings):
+    lr: float = 0.03
+    beta1: float = 0.9
+    beta2: float = 0.999
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.0
+    grad_clip_norm: float = 1.0
+
+
+class Hyperparameters:
+    def __init__(self) -> None:
+        self.data = DataConfig()
+        self.run = RunConfig()
+        self.schedule = ScheduleConfig()
+        self.model_common = ModelCommonConfig()
+        self.v1 = V1Config()
+        self.v2 = V2Config()
+        self.v4 = V4Config()
+        self.wave = WaveConfig()
+        self.lgp = LgpConfig()
+        self.graph = GraphConfig()
+        self.meta = MetaStateConfig()
+        self.tpg = TpgConfig()
+        self.sparse = SparseRegisterConfig()
+        self.optimizer = OptimizerConfig()
+        self._groups = [
+            self.data, self.run, self.schedule, self.model_common,
+            self.v1, self.v2, self.v4, self.wave, self.lgp,
+            self.graph, self.meta, self.tpg, self.sparse, self.optimizer,
+        ]
+
+    def __getattr__(self, name: str):
+        for group in self._groups:
+            try:
+                return getattr(group, name)
+            except AttributeError:
+                continue
+        raise AttributeError(f"Hyperparameters has no field {name!r}")
+
+
+# Patterns for control tensors (kept in float32)
+CONTROL_TENSOR_NAME_PATTERNS = (
+    "mem_scale", "op_scale", "read_coeffs", "write_coeffs",
+    "channel_mix", "bias", "out_scale", "logit_scale", "decay_logit",
+    "coeffs",
+    # v4 additions
+    "diag", "mix_down", "mix_up", "decay_logits", "_override",
+    # gauss additions
+    "freq_to_ch", "ch_to_freq", "weight",
+    # lgp additions
+    "op_logits", "op_weights", "op_biases",
+    # graph additions
+    "q_scale", "k_scale", "diag", "prop_scale", "interact_scale",
+    # tpg additions
+    "halt_proj", "act_selector", "scale_gate", "t_scale",
+    # sparse register additions (v12)
+    "mem_scale", "write_scale", "mlp_bias",
+)
+
+# -----------------------------
+# VALIDATION + QUANTIZATION
+# -----------------------------
+
+def build_sentencepiece_luts(sp, vocab_size, device):
+    sv = int(sp.vocab_size())
+    ts = max(sv, vocab_size)
+    bb = np.zeros((ts,), dtype=np.int16)
+    hs = np.zeros((ts,), dtype=np.bool_)
+    ib = np.ones((ts,), dtype=np.bool_)
+    for tid in range(sv):
+        if sp.is_control(tid) or sp.is_unknown(tid) or sp.is_unused(tid):
+            continue
+        ib[tid] = False
+        if sp.is_byte(tid):
+            bb[tid] = 1
+            continue
+        piece = sp.id_to_piece(tid)
+        if piece.startswith("▁"):
+            hs[tid] = True
+            piece = piece[1:]
+        bb[tid] = len(piece.encode("utf-8"))
+    return (torch.tensor(bb, dtype=torch.int16, device=device),
+            torch.tensor(hs, dtype=torch.bool, device=device),
+            torch.tensor(ib, dtype=torch.bool, device=device))
+
+
+def load_data_shard(file):
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Bad header: {file}")
+    n = int(header[2])
+    tokens = np.fromfile(file, dtype="<u2", count=n, offset=256 * 4)
+    return torch.from_numpy(tokens.astype(np.uint16, copy=False))
+
+
+def load_validation_tokens(pattern, seq_len):
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files: {pattern}")
+    tokens = torch.cat([load_data_shard(f) for f in files]).contiguous()
+    usable = ((tokens.numel() - 1) // seq_len) * seq_len
+    return tokens[:usable + 1]
+
+
+class TokenStream:
+    def __init__(self, pattern):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files: {pattern}")
+        self.file_idx = 0
+        self.tokens = load_data_shard(self.files[0])
+        self.pos = 0
+
+    def _advance(self):
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = 0
+
+    def take(self, n):
+        chunks = []
+        left = n
+        while left > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance()
+                continue
+            k = min(left, avail)
+            chunks.append(self.tokens[self.pos:self.pos + k])
+            self.pos += k
+            left -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedTokenLoader:
+    def __init__(self, pattern, rank, world_size, device):
+        self.rank, self.world_size, self.device = rank, world_size, device
+        self.stream = TokenStream(pattern)
+
+    def next_batch(self, global_tokens, seq_len, grad_accum_steps):
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        span = local_tokens + 1
+        chunk = self.stream.take(span * self.world_size)
+        start = self.rank * span
+        local = chunk[start:start + span].to(dtype=torch.int64)
+        x, y = local[:-1].reshape(-1, seq_len), local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+def eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl):
+    lbt = args.val_batch_size // (world_size * grad_accum_steps)
+    if lbt < args.train_seq_len:
+        raise ValueError("VAL_BATCH_SIZE too small")
+    lbs = lbt // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    ss, se = (total_seqs * rank) // world_size, (total_seqs * (rank + 1)) // world_size
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    tok_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    model.eval()
+    with torch.inference_mode():
+        for bs in range(ss, se, lbs):
+            be = min(bs + lbs, se)
+            local = val_tokens[bs * args.train_seq_len:be * args.train_seq_len + 1].to(device=device, dtype=torch.int64)
+            x, y = local[:-1].reshape(-1, args.train_seq_len), local[1:].reshape(-1, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                bl = model(x, y).detach()
+            ct = float(y.numel())
+            loss_sum += bl.to(torch.float64) * ct
+            tok_count += ct
+            tb = bbl[y.reshape(-1)].to(torch.float64)
+            tb += (hsl[y.reshape(-1)] & ~ibl[x.reshape(-1)]).to(torch.float64)
+            byte_count += tb.sum()
+    if dist.is_available() and dist.is_initialized():
+        for t in (loss_sum, tok_count, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    vl = (loss_sum / tok_count).item()
+    model.train()
+    return vl, vl / math.log(2.0) * (tok_count.item() / byte_count.item())
+
+
+INT8_CLIP_Q = 99.99984 / 100.0
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+
+def quantize_state_dict_int8(sd):
+    quantized, scales, dtypes, passthrough = {}, {}, {}, {}
+    passthrough_orig_dtypes, qmeta = {}, {}
+    stats = dict.fromkeys(("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0)
+    for name, tensor in sd.items():
+        t = tensor.detach().cpu().contiguous()
+        stats["param_count"] += t.numel()
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += t.numel() * t.element_size()
+        if not t.is_floating_point():
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += t.numel() * t.element_size()
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+                kept = t.float().contiguous()
+            elif t.dtype in {torch.float32, torch.bfloat16}:
+                passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+                kept = t.to(torch.float16).contiguous()
+            else:
+                kept = t
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += kept.numel() * kept.element_size()
+            continue
+        stats["num_float_tensors"] += 1
+        t32 = t.float()
+        if t32.ndim == 2:
+            ca = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            clipped = torch.clamp(t32, -ca[:, None], ca[:, None])
+            s = (ca / 127.0).clamp_min(1.0 / 127.0)
+            q = torch.clamp(torch.round(clipped / s[:, None]), -127, 127).to(torch.int8)
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            scales[name] = s.to(torch.float16).contiguous()
+        else:
+            ca = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+            s = torch.tensor(ca / 127.0 if ca > 0 else 1.0, dtype=torch.float32)
+            q = torch.clamp(torch.round(torch.clamp(t32, -ca, ca) / s), -127, 127).to(torch.int8)
+            scales[name] = s
+        quantized[name] = q.contiguous()
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += q.numel() + (scales[name].numel() * scales[name].element_size())
+    obj = {"__quant_format__": "int8_clean_per_row_v1", "quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
+    if qmeta: obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes: obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_int8(obj):
+    out = {}
+    qmeta = obj.get("qmeta", {})
+    pod = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dt = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name].to(torch.float32)
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dt)
+        else:
+            out[name] = (q.float() * s.item()).to(dt)
+    for name, t in obj["passthrough"].items():
+        od = pod.get(name)
+        out[name] = t.to(getattr(torch, od)) if isinstance(od, str) else t.detach().cpu()
+    return out
+
+
+# -----------------------------
+# MODEL
+# -----------------------------
+
+def apply_activation(x, activation):
+    if activation == "gelu":
+        return F.gelu(x)
+    elif activation == "relu2":
+        return F.relu(x).square()
+    elif activation == "swish":
+        return F.silu(x)
+    return F.gelu(x)
+
+
+class FourierProjection(nn.Module):
+    """Project vocab-space to channels via Fourier basis coefficients."""
+    def __init__(self, n_basis, n_channels, soft=False):
+        super().__init__()
+        self.soft = soft
+        self.coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * 0.02)
+
+    def forward(self, basis):
+        w = basis @ self.coeffs.T
+        if self.soft:
+            w = torch.softmax(w, dim=0)
+        return w
+
+
+class AssociativeMemoryStep(nn.Module):
+    """Cross-position mixing via causal decay-weighted associative memory (parallel)."""
+    def __init__(self, n_basis, n_channels, decay_init=3.0):
+        super().__init__()
+        self.n_channels = n_channels
+        self.query_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.key_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.value_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.output_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        B, T, V = x.shape
+        dtype = x.dtype
+
+        q_w = self.query_proj(basis).to(dtype)
+        k_w = self.key_proj(basis).to(dtype)
+        v_w = self.value_proj(basis).to(dtype)
+        o_w = self.output_proj(basis).to(dtype)
+
+        queries = x @ q_w
+        keys = x @ k_w
+        values = x @ v_w
+
+        # Content similarity in channel space
+        scores = torch.bmm(queries, keys.transpose(1, 2))  # (B, T, T)
+
+        # Causal decay mask: decay^(t-s-1) for s < t, 0 otherwise
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)  # (T, T)
+        causal_mask = (diff > 0)
+        decay_weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal_mask
+        scores = scores * decay_weights.to(dtype).unsqueeze(0)
+
+        # Retrieve: weighted sum of values
+        retrieved = torch.bmm(scores, values)  # (B, T, C)
+
+        return retrieved @ o_w.T * self.out_scale.to(dtype)
+
+
+class FourierRegisterOp(nn.Module):
+    """Within-position register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu"):
+        super().__init__()
+        self.activation = activation
+        s = 0.02
+        self.read_coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * s)
+        self.write_coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * s)
+        self.channel_mix = nn.Parameter(torch.randn(n_channels, n_channels) * s)
+        self.bias = nn.Parameter(torch.zeros(n_channels))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        read_p = torch.softmax(basis @ self.read_coeffs.T, dim=0).to(x.dtype)
+        values = x @ read_p
+        values = values @ self.channel_mix.to(x.dtype) + self.bias.to(x.dtype)
+        values = apply_activation(values, self.activation)
+        write_p = (basis @ self.write_coeffs.T).to(x.dtype)
+        return values @ write_p.T * self.out_scale.to(x.dtype)
+
+
+class RegisterStep(nn.Module):
+    """One LGP instruction: memory read/write + register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.memory = AssociativeMemoryStep(n_basis, n_channels, decay_init)
+        self.register_op = FourierRegisterOp(n_basis, n_channels, activation)
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x, basis):
+        D = x.size(-1)
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)), basis)
+        x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)), basis)
+        return x
+
+
+class AssocRegisterLM(nn.Module):
+    """Register machine with associative memory. No attention. No embedding."""
+    def __init__(self, vocab_size, num_steps, n_fourier_basis, n_channels,
+                 logit_softcap, activation="gelu", decay_init=0.95):
+        super().__init__()
+        dim = vocab_size
+        self.vocab_size = vocab_size
+        self.num_steps = num_steps
+        self.logit_softcap = logit_softcap
+
+        self.steps = nn.ModuleList([
+            RegisterStep(n_fourier_basis, n_channels, activation, decay_init)
+            for _ in range(num_steps)
+        ])
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+        positions = torch.arange(dim, dtype=torch.float32) / dim
+        basis = torch.zeros(dim, 2 * n_fourier_basis)
+        for k in range(n_fourier_basis):
+            basis[:, 2 * k] = torch.cos(2 * math.pi * (k + 1) * positions)
+            basis[:, 2 * k + 1] = torch.sin(2 * math.pi * (k + 1) * positions)
+        self.register_buffer("fourier_basis", basis, persistent=True)
+
+    def forward(self, input_ids, target_ids):
+        V = self.vocab_size
+        x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
+        x = F.rms_norm(x, (V,))
+        basis = self.fourier_basis
+
+        for step in self.steps:
+            x = step(x, basis)
+
+        x = F.rms_norm(x, (V,))
+        logits = x * self.logit_scale.to(x.dtype)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="mean")
+
+
+# -----------------------------
+# GAUSS MODEL (FFT-based)
+# -----------------------------
+
+class GaussProjection(nn.Module):
+    """Project vocab-space to channels via FFT."""
+    def __init__(self, n_freq, n_channels):
+        super().__init__()
+        self.n_freq = n_freq
+        self.weight = nn.Parameter(torch.randn(n_channels, 2 * n_freq) * 0.02)
+
+    def forward(self, x):
+        X = torch.fft.rfft(x.float(), dim=-1)
+        X = X[..., 1:self.n_freq + 1]
+        X_ri = torch.cat([X.real, X.imag], dim=-1)
+        return (X_ri @ self.weight.T).to(x.dtype)
+
+
+class GaussSynthesis(nn.Module):
+    """Project channels back to vocab-space via IFFT."""
+    def __init__(self, n_freq, n_channels, vocab_size):
+        super().__init__()
+        self.n_freq = n_freq
+        self.vocab_size = vocab_size
+        self.weight = nn.Parameter(torch.randn(2 * n_freq, n_channels) * 0.02)
+
+    def forward(self, h):
+        n, V = self.n_freq, self.vocab_size
+        Y_ri = h.float() @ self.weight
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
+        shape = list(h.shape[:-1]) + [V // 2 + 1]
+        full = torch.zeros(shape, dtype=Y.dtype, device=h.device)
+        full[..., 1:n + 1] = Y
+        return torch.fft.irfft(full, n=V, dim=-1).to(h.dtype)
+
+
+class GaussMemoryStep(nn.Module):
+    """Cross-position mixing via FFT projections + causal decay memory."""
+    def __init__(self, n_freq, n_channels, vocab_size, decay_init=3.0):
+        super().__init__()
+        self.n_channels = n_channels
+        self.q_proj = GaussProjection(n_freq, n_channels)
+        self.k_proj = GaussProjection(n_freq, n_channels)
+        self.v_proj = GaussProjection(n_freq, n_channels)
+        self.o_proj = GaussSynthesis(n_freq, n_channels, vocab_size)
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        B, T, V = x.shape
+        dtype = x.dtype
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        scores = torch.bmm(queries, keys.transpose(1, 2))
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+        causal = (diff > 0)
+        weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal
+        scores = scores * weights.to(dtype).unsqueeze(0)
+        retrieved = torch.bmm(scores, values)
+        return self.o_proj(retrieved) * self.out_scale.to(dtype)
+
+
+class GaussRegisterOp(nn.Module):
+    """Within-position transform via FFT → channels → IFFT."""
+    def __init__(self, n_freq, n_channels, vocab_size, activation="gelu"):
+        super().__init__()
+        self.activation = activation
+        self.n_freq = n_freq
+        self.vocab_size = vocab_size
+        s = 0.02
+        self.freq_to_ch = nn.Parameter(torch.randn(n_channels, 2 * n_freq) * s)
+        self.channel_mix = nn.Parameter(torch.randn(n_channels, n_channels) * s)
+        self.bias = nn.Parameter(torch.zeros(n_channels))
+        self.ch_to_freq = nn.Parameter(torch.randn(2 * n_freq, n_channels) * s)
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        B, T, V = x.shape
+        dtype = x.dtype
+        n = self.n_freq
+        X = torch.fft.rfft(x.float(), dim=-1)
+        X = X[..., 1:n + 1]
+        X_ri = torch.cat([X.real, X.imag], dim=-1)
+        h = X_ri @ self.freq_to_ch.T
+        h = h @ self.channel_mix + self.bias
+        h = apply_activation(h, self.activation)
+        Y_ri = h @ self.ch_to_freq.T
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
+        full = torch.zeros(B, T, V // 2 + 1, dtype=Y.dtype, device=x.device)
+        full[..., 1:n + 1] = Y
+        return torch.fft.irfft(full, n=V, dim=-1).to(dtype) * self.out_scale.to(dtype)
+
+
+class GaussRegisterStep(nn.Module):
+    """One step: FFT memory + FFT register op."""
+    def __init__(self, n_freq, n_channels, vocab_size, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.memory = GaussMemoryStep(n_freq, n_channels, vocab_size, decay_init)
+        self.register_op = GaussRegisterOp(n_freq, n_channels, vocab_size, activation)
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        D = x.size(-1)
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)))
+        x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)))
+        return x
+
+
+class GaussRegisterGPT(nn.Module):
+    """Register machine with FFT-based operations. No stored Fourier basis."""
+    def __init__(self, vocab_size, num_steps, n_freq, n_channels,
+                 logit_softcap, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.num_steps = num_steps
+        self.logit_softcap = logit_softcap
+        self.steps = nn.ModuleList([
+            GaussRegisterStep(n_freq, n_channels, vocab_size, activation, decay_init)
+            for _ in range(num_steps)
+        ])
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, input_ids, target_ids):
+        V = self.vocab_size
+        x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
+        x = F.rms_norm(x, (V,))
+        for step in self.steps:
+            x = step(x)
+        x = F.rms_norm(x, (V,))
+        logits = x * self.logit_scale.to(x.dtype)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="mean")
+
+
+# -----------------------------
+# V4 MODEL (param-optimized, see model_v4.py for documented implementation)
+# -----------------------------
+
+from v4_param_optimized.model import RegisterGPTv4
+
+
+# -----------------------------
+# TRAINING
+# -----------------------------
+
+def main():
+    code = Path(__file__).read_text(encoding="utf-8")
+    args = Hyperparameters()
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    grad_accum_steps = int(os.environ.get("GRAD_ACCUM_STEPS", "16"))
+    grad_scale = 1.0 / grad_accum_steps
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        dist.barrier()
+    master = rank == 0
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    logfile = None
+    if master:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg, console=True):
+        if not master: return
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        if console: print(line)
+        if logfile:
+            with open(logfile, "a") as f: print(line, file=f)
+
+    log0(code, console=False)
+    log0(f"[init] rank={rank} world_size={world_size} device={device} model_version={args.model_version}")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    print(f"[rank {rank}] loading tokenizer", flush=True)
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    if int(sp.vocab_size()) != args.vocab_size:
+        raise ValueError(f"VOCAB_SIZE mismatch")
+    print(f"[rank {rank}] loading validation data", flush=True)
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    print(f"[rank {rank}] building sentencepiece luts", flush=True)
+    bbl, hsl, ibl = build_sentencepiece_luts(sp, args.vocab_size, device)
+    print(f"[rank {rank}] data loaded: {val_tokens.numel()} val tokens", flush=True)
+    print(f"[rank {rank}] building model: {args.model_version}", flush=True)
+
+    if args.model_version == "v1":
+        from v1_shared_attention.model import RegisterGPT as RegisterGPTv1
+        base_model = RegisterGPTv1(
+            vocab_size=args.vocab_size,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            num_steps=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            activation=args.activation,
+        ).to(device).bfloat16()
+    elif args.model_version == "v2":
+        from v2_causal_conv.model import RegisterGPT as RegisterGPTv2
+        base_model = RegisterGPTv2(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            kernel_size=args.kernel_size,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+        ).to(device).bfloat16()
+    elif args.model_version == "wave":
+        from v6_brain_wave.model import BrainWaveGPT
+        band_split = tuple(int(x) for x in args.band_split.split(","))
+        base_model = BrainWaveGPT(
+            vocab_size=args.vocab_size,
+            num_cycles=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            slow_decay_init=args.slow_decay_init,
+            fast_decay_init=args.fast_decay_init,
+            band_split=band_split,
+        ).to(device).bfloat16()
+    elif args.model_version == "v4":
+        base_model = RegisterGPTv4(
+            vocab_size=args.vocab_size,
+            unique_steps=args.unique_steps,
+            invocations_per_step=args.invocations_per_step,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            n_heads=args.n_heads,
+            transform_rank=args.transform_rank,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "gauss":
+        n_freq = args.n_fourier_basis
+        base_model = GaussRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            n_freq=n_freq,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "lgp":
+        from v7_lgp.model import LGPGPT
+        base_model = LGPGPT(
+            vocab_size=args.vocab_size,
+            num_instructions=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            n_ops=args.n_ops,
+            logit_softcap=args.logit_softcap,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "graph":
+        from v8_word_graph.model import WordGraphGPT
+        base_model = WordGraphGPT(
+            vocab_size=args.vocab_size,
+            num_hops=args.num_steps,
+            interaction_rank=args.interaction_rank,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "policy":
+        from v10_policy.model import PolicyGPT
+        base_model = PolicyGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            n_ops=args.n_ops,
+            logit_softcap=args.logit_softcap,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "brainwave":
+        from v11_brainwave.model import BrainWaveGPT as BrainWaveGPTv11
+        base_model = BrainWaveGPTv11(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            gate_dim=args.state_dim,
+            logit_softcap=args.logit_softcap,
+        ).to(device).bfloat16()
+    elif args.model_version == "meta":
+        from v9_meta_state.model import MetaStateGPT
+        base_model = MetaStateGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "sparse":
+        from v12_sparse_register.model import SparseRegisterGPT
+        base_model = SparseRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            k_active=args.k_active,
+            inner_mul=args.inner_mul,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+            parallel_waves=args.parallel_waves,
+            grad_checkpoint=args.grad_checkpoint,
+        ).to(device).bfloat16()
+    elif args.model_version == "tpg":
+        from v11_tpg.model import TPGGPT
+        base_model = TPGGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            tau=args.gumbel_tau,
+            halt_threshold=args.halt_threshold,
+            ponder_lambda=args.ponder_lambda,
+        ).to(device).bfloat16()
+    else:
+        base_model = AssocRegisterLM(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+
+    # Keep small control params in fp32
+    with torch.no_grad():
+        for name, p in base_model.named_parameters():
+            if (p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)) and p.dtype != torch.float32:
+                p.data = p.data.float()
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"[init] model built: {n_params/1e3:.0f}K params on {device}")
+
+    use_compile = bool(int(os.environ.get("TORCH_COMPILE", "0")))
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
+    if distributed:
+        print(f"[rank {rank}] reached DDP barrier", flush=True)
+        dist.barrier()
+        print(f"[rank {rank}] passed DDP barrier, calling DDP()", flush=True)
+    log0(f"[init] wrapping with DDP (distributed={distributed})")
+    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    log0(f"[init] DDP ready")
+
+    optimizer = torch.optim.Adam(
+        base_model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+    for g in optimizer.param_groups:
+        g["base_lr"] = args.lr
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    n_trainable = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    raw_bytes = sum(p.numel() * p.element_size() for p in base_model.parameters())
+    est_int8_bytes = sum(p.numel() for p in base_model.parameters())  # ~1 byte per param
+    log0(f"run_id:{args.run_id}")
+    log0(f"model_version:{args.model_version}")
+    log0(f"model_params:{n_params} trainable:{n_trainable} vocab=dim={args.vocab_size} raw:{raw_bytes/1e6:.1f}MB est_int8:{est_int8_bytes/1e6:.1f}MB")
+    if args.model_version == "wave":
+        log0(f"architecture:BrainWaveGPT (oscillatory dynamics, cross-frequency coupling)")
+        log0(f"cycles:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis} bands:{args.band_split}")
+        log0(f"slow_decay_init:{args.slow_decay_init} fast_decay_init:{args.fast_decay_init}")
+    elif args.model_version == "v4":
+        log0(f"unique_steps:{args.unique_steps} invocations:{args.invocations_per_step} depth:{args.unique_steps * args.invocations_per_step}")
+        log0(f"channels:{args.n_channels} heads:{args.n_heads} rank:{args.transform_rank} fourier:{args.n_fourier_basis}")
+    else:
+        log0(f"steps:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis}")
+    log0(f"activation:{args.activation} lr:{args.lr} grad_clip:{args.grad_clip_norm} decay_init:{args.decay_init}")
+    log0(f"NO attention. NO embedding. NO output projection.")
+    log0(f"world_size:{world_size} grad_accum:{grad_accum_steps} batch:{args.train_batch_tokens}")
+
+    log0(f"[init] loading training data from {args.train_files}")
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    max_wc_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds else None
+
+    def lr_mul(step, elapsed_ms):
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wc_ms is None:
+            ws = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if ws <= step < args.iterations else 1.0
+        sms = elapsed_ms / max(step, 1)
+        wms = args.warmdown_iters * sms
+        rms = max(max_wc_ms - elapsed_ms, 0.0)
+        return rms / max(wms, 1e-9) if rms <= wms else 1.0
+
+    # Resume from checkpoint if provided
+    start_step = 0
+    if args.resume_from and Path(args.resume_from).exists():
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        if "model" in ckpt and "step" in ckpt:
+            # Full checkpoint (model + optimizer + step)
+            base_model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_step = ckpt["step"]
+            log0(f"resumed checkpoint from {args.resume_from} at step {start_step}")
+        else:
+            # Plain state dict (weights only)
+            base_model.load_state_dict(ckpt, strict=False)
+            log0(f"loaded weights from {args.resume_from} (no optimizer/step, restarting from 0)")
+
+    def save_checkpoint(step):
+        if not master:
+            return
+        ckpt_path = f"logs/{args.run_id}_ckpt.pt"
+        torch.save({
+            "model": base_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+        }, ckpt_path)
+        log0(f"checkpoint:{ckpt_path} step:{step}")
+
+    # Warmup (skip if resuming)
+    log0(f"[init] starting warmup ({args.warmup_steps} steps)")
+    if start_step == 0:
+        for ws in range(args.warmup_steps):
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = model(x, y)
+                (loss * grad_scale).backward()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            optimizer.step()
+            torch.cuda.synchronize()
+            if master and (ws + 1) % 10 == 0 or ws + 1 == args.warmup_steps:
+                log0(f"warmup:{ws + 1}/{args.warmup_steps}")
+
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Training
+    train_ms = 0.0
+    stop_after = None
+    t0 = time.perf_counter()
+    step = start_step
+    while True:
+        last = step == args.iterations or (stop_after is not None and step >= stop_after)
+        if last or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            train_ms += 1000.0 * (time.perf_counter() - t0)
+            vl, vbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"step:{step}/{args.iterations} val_loss:{vl:.4f} val_bpb:{vbpb:.4f} train_time:{train_ms:.0f}ms")
+            t0 = time.perf_counter()
+        if last:
+            if stop_after is not None and step < args.iterations:
+                log0(f"stopping_early: step:{step}/{args.iterations}")
+            break
+
+        lm = lr_mul(step, train_ms + 1000.0 * (time.perf_counter() - t0))
+        for g in optimizer.param_groups:
+            g["lr"] = g["base_lr"] * lm
+
+        step_t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        train_loss_accum = 0.0
+        for _ in range(grad_accum_steps):
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+            (loss * grad_scale).backward()
+            train_loss_accum += loss.item() * grad_scale
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        approx_ms = train_ms + 1000.0 * (time.perf_counter() - t0)
+        step += 1
+        if master and args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0):
+            log0(f"step:{step}/{args.iterations} train_loss:{train_loss_accum:.4f} time:{approx_ms:.0f}ms avg:{approx_ms / step:.1f}ms tok/s:{args.train_batch_tokens / (step_ms / 1000):.0f}")
+        if max_wc_ms and stop_after is None and approx_ms >= max_wc_ms:
+            stop_after = step
+        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            save_checkpoint(step)
+
+    # Final checkpoint
+    save_checkpoint(step)
+
+    # Serialize
+    if master:
+        sd = {k: v for k, v in base_model.state_dict().items()}
+        out = f"logs/{args.run_id}_model.pt"
+        torch.save(sd, out)
+        log0(f"saved:{out} bytes:{Path(out).stat().st_size}")
+
+        qobj, qstats = quantize_state_dict_int8(sd)
+        buf = io.BytesIO()
+        torch.save(qobj, buf)
+        compressed = zlib.compress(buf.getvalue(), 9)
+        qpath = f"logs/{args.run_id}_model.int8.ptz"
+        Path(qpath).write_bytes(compressed)
+        log0(f"quantized:{qpath} bytes:{len(compressed)} ratio:{qstats['baseline_tensor_bytes'] / max(qstats['int8_payload_bytes'], 1):.2f}x")
+
+        if bool(int(os.environ.get("ROUNDTRIP_EVAL", "0"))):
+            dq = dequantize_state_dict_int8(torch.load(io.BytesIO(zlib.decompress(Path(qpath).read_bytes())), weights_only=False))
+            base_model.load_state_dict(dq, strict=False)
+            qvl, qvbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"final_int8_zlib_roundtrip val_loss:{qvl:.4f} val_bpb:{qvbpb:.4f}")
+
+        # Write manifest
+        import json as _json
+        manifest = {
+            "run_id": args.run_id,
+            "model_version": args.model_version,
+            "params": n_params,
+            "trainable": n_trainable,
+            "raw_bytes": raw_bytes,
+            "est_int8_bytes": est_int8_bytes,
+            "quantized_bytes": len(compressed),
+            "vocab_size": args.vocab_size,
+            "num_steps": args.num_steps,
+            "n_channels": getattr(args, "n_channels", None),
+            "n_fourier_basis": getattr(args, "n_fourier_basis", None),
+            "state_dim": getattr(args, "state_dim", None),
+            "inner_dim": getattr(args, "inner_dim", None),
+            "n_ops": getattr(args, "n_ops", None),
+            "lr": args.lr,
+            "activation": args.activation,
+            "decay_init": args.decay_init,
+            "steps_trained": step,
+            "final_train_loss": train_loss_accum if step > start_step else None,
+            "val_loss": vl,
+            "val_bpb": vbpb,
+            "train_time_ms": train_ms,
+            "world_size": world_size,
+            "grad_accum_steps": grad_accum_steps,
+            "batch_tokens": args.train_batch_tokens,
+            "model_path": out,
+            "quantized_path": qpath,
+        }
+        manifest_path = f"logs/{args.run_id}_manifest.json"
+        with open(manifest_path, "w") as f:
+            _json.dump(manifest, f, indent=2)
+        log0(f"manifest:{manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+[20:57:18] [init] rank=0 world_size=3 device=cuda:0 model_version=v3
+[20:57:18] [init] model built: 329K params on cuda:0
+[20:57:18] [init] wrapping with DDP (distributed=True)
+[21:06:07] """
+RegisterGPT v3 — Register machine with associative memory, PyTorch/CUDA training.
+Outer-product memory for cross-position mixing. Fourier ops for within-position transforms.
+No attention. No embedding. No output projection.
+Compatible with torchrun for multi-GPU training.
+"""
+from __future__ import annotations
+
+import copy
+import glob
+import io
+import math
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+import zlib
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import sentencepiece as spm
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from pydantic import Field, computed_field
+from pydantic_settings import BaseSettings
+from torch import Tensor, nn
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+# -----------------------------
+# HYPERPARAMETERS
+# -----------------------------
+
+
+class DataConfig(BaseSettings):
+    data_path: str = "./data/datasets/fineweb10B_sp1024"
+    tokenizer_path: str = "./data/tokenizers/fineweb_1024_bpe.model"
+
+    @computed_field
+    @property
+    def train_files(self) -> str:
+        return os.path.join(self.data_path, "fineweb_train_*.bin")
+
+    @computed_field
+    @property
+    def val_files(self) -> str:
+        return os.path.join(self.data_path, "fineweb_val_*.bin")
+
+
+class RunConfig(BaseSettings):
+    run_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    resume_from: str = Field("", validation_alias="RESUME")
+    checkpoint_every: int = 500
+    seed: int = 1337
+
+
+class ScheduleConfig(BaseSettings):
+    val_batch_size: int = 524_288
+    val_loss_every: int = 1000
+    train_log_every: int = 200
+    iterations: int = 500
+    warmdown_iters: int = 1200
+    warmup_steps: int = 20
+    train_batch_tokens: int = 524_288
+    train_seq_len: int = 1024
+    max_wallclock_seconds: Optional[float] = None
+
+
+class ModelCommonConfig(BaseSettings):
+    model_version: str = "v3"
+    vocab_size: int = 1024
+    num_steps: int = 8
+    n_fourier_basis: int = 16
+    n_channels: int = 128
+    activation: str = "gelu"
+    logit_softcap: float = 30.0
+    decay_init: float = 3.0
+
+
+class V1Config(BaseSettings):
+    num_heads: int = 8
+    num_kv_heads: int = 4
+    rope_base: float = 10000.0
+    qk_gain_init: float = 1.5
+
+
+class V2Config(BaseSettings):
+    kernel_size: int = 16
+
+
+class V4Config(BaseSettings):
+    n_heads: int = 4
+    transform_rank: int = 8
+    unique_steps: int = 5
+    invocations_per_step: int = 2
+
+
+class WaveConfig(BaseSettings):
+    slow_decay_init: float = 4.0
+    fast_decay_init: float = 2.0
+    band_split: str = "4,4,8"
+
+
+class LgpConfig(BaseSettings):
+    n_ops: int = 8
+
+
+class GraphConfig(BaseSettings):
+    interaction_rank: int = 64
+
+
+class MetaStateConfig(BaseSettings):
+    state_dim: int = 64
+    inner_dim: int = 128
+
+
+class TpgConfig(BaseSettings):
+    gumbel_tau: float = 1.0
+    halt_threshold: float = 0.5
+    ponder_lambda: float = 0.01
+
+
+class SparseRegisterConfig(BaseSettings):
+    k_active: int = 256
+    inner_mul: int = 2
+    parallel_waves: bool = True
+    grad_checkpoint: bool = False
+
+
+class OptimizerConfig(BaseSettings):
+    lr: float = 0.03
+    beta1: float = 0.9
+    beta2: float = 0.999
+    adam_eps: float = 1e-8
+    weight_decay: float = 0.0
+    grad_clip_norm: float = 1.0
+
+
+class DistributedConfig(BaseSettings):
+    nccl_p2p_disable: str = "1"
+    grad_accum_steps: int = 16
+    torch_compile: bool = False
+    roundtrip_eval: bool = False
+
+
+class Hyperparameters:
+    def __init__(self) -> None:
+        self.data = DataConfig()
+        self.run = RunConfig()
+        self.schedule = ScheduleConfig()
+        self.model_common = ModelCommonConfig()
+        self.v1 = V1Config()
+        self.v2 = V2Config()
+        self.v4 = V4Config()
+        self.wave = WaveConfig()
+        self.lgp = LgpConfig()
+        self.graph = GraphConfig()
+        self.meta = MetaStateConfig()
+        self.tpg = TpgConfig()
+        self.sparse = SparseRegisterConfig()
+        self.optimizer = OptimizerConfig()
+        self.distributed = DistributedConfig()
+        self._groups = [
+            self.data, self.run, self.schedule, self.model_common,
+            self.v1, self.v2, self.v4, self.wave, self.lgp,
+            self.graph, self.meta, self.tpg, self.sparse, self.optimizer,
+            self.distributed,
+        ]
+
+    def __getattr__(self, name: str):
+        for group in self._groups:
+            try:
+                return getattr(group, name)
+            except AttributeError:
+                continue
+        raise AttributeError(f"Hyperparameters has no field {name!r}")
+
+
+# Patterns for control tensors (kept in float32)
+CONTROL_TENSOR_NAME_PATTERNS = (
+    "mem_scale", "op_scale", "read_coeffs", "write_coeffs",
+    "channel_mix", "bias", "out_scale", "logit_scale", "decay_logit",
+    "coeffs",
+    # v4 additions
+    "diag", "mix_down", "mix_up", "decay_logits", "_override",
+    # gauss additions
+    "freq_to_ch", "ch_to_freq", "weight",
+    # lgp additions
+    "op_logits", "op_weights", "op_biases",
+    # graph additions
+    "q_scale", "k_scale", "diag", "prop_scale", "interact_scale",
+    # tpg additions
+    "halt_proj", "act_selector", "scale_gate", "t_scale",
+    # sparse register additions (v12)
+    "mem_scale", "write_scale", "mlp_bias",
+)
+
+# -----------------------------
+# VALIDATION + QUANTIZATION
+# -----------------------------
+
+def build_sentencepiece_luts(sp, vocab_size, device):
+    sv = int(sp.vocab_size())
+    ts = max(sv, vocab_size)
+    bb = np.zeros((ts,), dtype=np.int16)
+    hs = np.zeros((ts,), dtype=np.bool_)
+    ib = np.ones((ts,), dtype=np.bool_)
+    for tid in range(sv):
+        if sp.is_control(tid) or sp.is_unknown(tid) or sp.is_unused(tid):
+            continue
+        ib[tid] = False
+        if sp.is_byte(tid):
+            bb[tid] = 1
+            continue
+        piece = sp.id_to_piece(tid)
+        if piece.startswith("▁"):
+            hs[tid] = True
+            piece = piece[1:]
+        bb[tid] = len(piece.encode("utf-8"))
+    return (torch.tensor(bb, dtype=torch.int16, device=device),
+            torch.tensor(hs, dtype=torch.bool, device=device),
+            torch.tensor(ib, dtype=torch.bool, device=device))
+
+
+def load_data_shard(file):
+    header = np.fromfile(file, dtype="<i4", count=256)
+    if header.size != 256 or int(header[0]) != 20240520 or int(header[1]) != 1:
+        raise ValueError(f"Bad header: {file}")
+    n = int(header[2])
+    tokens = np.fromfile(file, dtype="<u2", count=n, offset=256 * 4)
+    return torch.from_numpy(tokens.astype(np.uint16, copy=False))
+
+
+def load_validation_tokens(pattern, seq_len):
+    files = [Path(p) for p in sorted(glob.glob(pattern))]
+    if not files:
+        raise FileNotFoundError(f"No files: {pattern}")
+    tokens = torch.cat([load_data_shard(f) for f in files]).contiguous()
+    usable = ((tokens.numel() - 1) // seq_len) * seq_len
+    return tokens[:usable + 1]
+
+
+class TokenStream:
+    def __init__(self, pattern):
+        self.files = [Path(p) for p in sorted(glob.glob(pattern))]
+        if not self.files:
+            raise FileNotFoundError(f"No files: {pattern}")
+        self.file_idx = 0
+        self.tokens = load_data_shard(self.files[0])
+        self.pos = 0
+
+    def _advance(self):
+        self.file_idx = (self.file_idx + 1) % len(self.files)
+        self.tokens = load_data_shard(self.files[self.file_idx])
+        self.pos = 0
+
+    def take(self, n):
+        chunks = []
+        left = n
+        while left > 0:
+            avail = self.tokens.numel() - self.pos
+            if avail <= 0:
+                self._advance()
+                continue
+            k = min(left, avail)
+            chunks.append(self.tokens[self.pos:self.pos + k])
+            self.pos += k
+            left -= k
+        return chunks[0] if len(chunks) == 1 else torch.cat(chunks)
+
+
+class DistributedTokenLoader:
+    def __init__(self, pattern, rank, world_size, device):
+        self.rank, self.world_size, self.device = rank, world_size, device
+        self.stream = TokenStream(pattern)
+
+    def next_batch(self, global_tokens, seq_len, grad_accum_steps):
+        local_tokens = global_tokens // (self.world_size * grad_accum_steps)
+        span = local_tokens + 1
+        chunk = self.stream.take(span * self.world_size)
+        start = self.rank * span
+        local = chunk[start:start + span].to(dtype=torch.int64)
+        x, y = local[:-1].reshape(-1, seq_len), local[1:].reshape(-1, seq_len)
+        return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
+
+
+def eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl):
+    lbt = args.val_batch_size // (world_size * grad_accum_steps)
+    if lbt < args.train_seq_len:
+        raise ValueError("VAL_BATCH_SIZE too small")
+    lbs = lbt // args.train_seq_len
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    ss, se = (total_seqs * rank) // world_size, (total_seqs * (rank + 1)) // world_size
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    tok_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    model.eval()
+    with torch.inference_mode():
+        for bs in range(ss, se, lbs):
+            be = min(bs + lbs, se)
+            local = val_tokens[bs * args.train_seq_len:be * args.train_seq_len + 1].to(device=device, dtype=torch.int64)
+            x, y = local[:-1].reshape(-1, args.train_seq_len), local[1:].reshape(-1, args.train_seq_len)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                bl = model(x, y).detach()
+            ct = float(y.numel())
+            loss_sum += bl.to(torch.float64) * ct
+            tok_count += ct
+            tb = bbl[y.reshape(-1)].to(torch.float64)
+            tb += (hsl[y.reshape(-1)] & ~ibl[x.reshape(-1)]).to(torch.float64)
+            byte_count += tb.sum()
+    if dist.is_available() and dist.is_initialized():
+        for t in (loss_sum, tok_count, byte_count):
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    vl = (loss_sum / tok_count).item()
+    model.train()
+    return vl, vl / math.log(2.0) * (tok_count.item() / byte_count.item())
+
+
+INT8_CLIP_Q = 99.99984 / 100.0
+INT8_KEEP_FLOAT_MAX_NUMEL = 65_536
+
+def quantize_state_dict_int8(sd):
+    quantized, scales, dtypes, passthrough = {}, {}, {}, {}
+    passthrough_orig_dtypes, qmeta = {}, {}
+    stats = dict.fromkeys(("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int8_payload_bytes"), 0)
+    for name, tensor in sd.items():
+        t = tensor.detach().cpu().contiguous()
+        stats["param_count"] += t.numel()
+        stats["num_tensors"] += 1
+        stats["baseline_tensor_bytes"] += t.numel() * t.element_size()
+        if not t.is_floating_point():
+            passthrough[name] = t
+            stats["int8_payload_bytes"] += t.numel() * t.element_size()
+            continue
+        if t.numel() <= INT8_KEEP_FLOAT_MAX_NUMEL:
+            if any(p in name for p in CONTROL_TENSOR_NAME_PATTERNS):
+                kept = t.float().contiguous()
+            elif t.dtype in {torch.float32, torch.bfloat16}:
+                passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
+                kept = t.to(torch.float16).contiguous()
+            else:
+                kept = t
+            passthrough[name] = kept
+            stats["int8_payload_bytes"] += kept.numel() * kept.element_size()
+            continue
+        stats["num_float_tensors"] += 1
+        t32 = t.float()
+        if t32.ndim == 2:
+            ca = torch.quantile(t32.abs(), INT8_CLIP_Q, dim=1)
+            clipped = torch.clamp(t32, -ca[:, None], ca[:, None])
+            s = (ca / 127.0).clamp_min(1.0 / 127.0)
+            q = torch.clamp(torch.round(clipped / s[:, None]), -127, 127).to(torch.int8)
+            qmeta[name] = {"scheme": "per_row", "axis": 0}
+            scales[name] = s.to(torch.float16).contiguous()
+        else:
+            ca = float(torch.quantile(t32.abs().flatten(), INT8_CLIP_Q).item()) if t32.numel() else 0.0
+            s = torch.tensor(ca / 127.0 if ca > 0 else 1.0, dtype=torch.float32)
+            q = torch.clamp(torch.round(torch.clamp(t32, -ca, ca) / s), -127, 127).to(torch.int8)
+            scales[name] = s
+        quantized[name] = q.contiguous()
+        dtypes[name] = str(t.dtype).removeprefix("torch.")
+        stats["int8_payload_bytes"] += q.numel() + (scales[name].numel() * scales[name].element_size())
+    obj = {"__quant_format__": "int8_clean_per_row_v1", "quantized": quantized, "scales": scales, "dtypes": dtypes, "passthrough": passthrough}
+    if qmeta: obj["qmeta"] = qmeta
+    if passthrough_orig_dtypes: obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
+    return obj, stats
+
+
+def dequantize_state_dict_int8(obj):
+    out = {}
+    qmeta = obj.get("qmeta", {})
+    pod = obj.get("passthrough_orig_dtypes", {})
+    for name, q in obj["quantized"].items():
+        dt = getattr(torch, obj["dtypes"][name])
+        s = obj["scales"][name].to(torch.float32)
+        if qmeta.get(name, {}).get("scheme") == "per_row" or s.ndim > 0:
+            out[name] = (q.float() * s.view(q.shape[0], *([1] * (q.ndim - 1)))).to(dt)
+        else:
+            out[name] = (q.float() * s.item()).to(dt)
+    for name, t in obj["passthrough"].items():
+        od = pod.get(name)
+        out[name] = t.to(getattr(torch, od)) if isinstance(od, str) else t.detach().cpu()
+    return out
+
+
+# -----------------------------
+# MODEL
+# -----------------------------
+
+def apply_activation(x, activation):
+    if activation == "gelu":
+        return F.gelu(x)
+    elif activation == "relu2":
+        return F.relu(x).square()
+    elif activation == "swish":
+        return F.silu(x)
+    return F.gelu(x)
+
+
+class FourierProjection(nn.Module):
+    """Project vocab-space to channels via Fourier basis coefficients."""
+    def __init__(self, n_basis, n_channels, soft=False):
+        super().__init__()
+        self.soft = soft
+        self.coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * 0.02)
+
+    def forward(self, basis):
+        w = basis @ self.coeffs.T
+        if self.soft:
+            w = torch.softmax(w, dim=0)
+        return w
+
+
+class AssociativeMemoryStep(nn.Module):
+    """Cross-position mixing via causal decay-weighted associative memory (parallel)."""
+    def __init__(self, n_basis, n_channels, decay_init=3.0):
+        super().__init__()
+        self.n_channels = n_channels
+        self.query_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.key_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.value_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.output_proj = FourierProjection(n_basis, n_channels, soft=False)
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        B, T, V = x.shape
+        dtype = x.dtype
+
+        q_w = self.query_proj(basis).to(dtype)
+        k_w = self.key_proj(basis).to(dtype)
+        v_w = self.value_proj(basis).to(dtype)
+        o_w = self.output_proj(basis).to(dtype)
+
+        queries = x @ q_w
+        keys = x @ k_w
+        values = x @ v_w
+
+        # Content similarity in channel space
+        scores = torch.bmm(queries, keys.transpose(1, 2))  # (B, T, T)
+
+        # Causal decay mask: decay^(t-s-1) for s < t, 0 otherwise
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)  # (T, T)
+        causal_mask = (diff > 0)
+        decay_weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal_mask
+        scores = scores * decay_weights.to(dtype).unsqueeze(0)
+
+        # Retrieve: weighted sum of values
+        retrieved = torch.bmm(scores, values)  # (B, T, C)
+
+        return retrieved @ o_w.T * self.out_scale.to(dtype)
+
+
+class FourierRegisterOp(nn.Module):
+    """Within-position register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu"):
+        super().__init__()
+        self.activation = activation
+        s = 0.02
+        self.read_coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * s)
+        self.write_coeffs = nn.Parameter(torch.randn(n_channels, 2 * n_basis) * s)
+        self.channel_mix = nn.Parameter(torch.randn(n_channels, n_channels) * s)
+        self.bias = nn.Parameter(torch.zeros(n_channels))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x, basis):
+        read_p = torch.softmax(basis @ self.read_coeffs.T, dim=0).to(x.dtype)
+        values = x @ read_p
+        values = values @ self.channel_mix.to(x.dtype) + self.bias.to(x.dtype)
+        values = apply_activation(values, self.activation)
+        write_p = (basis @ self.write_coeffs.T).to(x.dtype)
+        return values @ write_p.T * self.out_scale.to(x.dtype)
+
+
+class RegisterStep(nn.Module):
+    """One LGP instruction: memory read/write + register transform."""
+    def __init__(self, n_basis, n_channels, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.memory = AssociativeMemoryStep(n_basis, n_channels, decay_init)
+        self.register_op = FourierRegisterOp(n_basis, n_channels, activation)
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x, basis):
+        D = x.size(-1)
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)), basis)
+        x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)), basis)
+        return x
+
+
+class AssocRegisterLM(nn.Module):
+    """Register machine with associative memory. No attention. No embedding."""
+    def __init__(self, vocab_size, num_steps, n_fourier_basis, n_channels,
+                 logit_softcap, activation="gelu", decay_init=0.95):
+        super().__init__()
+        dim = vocab_size
+        self.vocab_size = vocab_size
+        self.num_steps = num_steps
+        self.logit_softcap = logit_softcap
+
+        self.steps = nn.ModuleList([
+            RegisterStep(n_fourier_basis, n_channels, activation, decay_init)
+            for _ in range(num_steps)
+        ])
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+        positions = torch.arange(dim, dtype=torch.float32) / dim
+        basis = torch.zeros(dim, 2 * n_fourier_basis)
+        for k in range(n_fourier_basis):
+            basis[:, 2 * k] = torch.cos(2 * math.pi * (k + 1) * positions)
+            basis[:, 2 * k + 1] = torch.sin(2 * math.pi * (k + 1) * positions)
+        self.register_buffer("fourier_basis", basis, persistent=True)
+
+    def forward(self, input_ids, target_ids):
+        V = self.vocab_size
+        x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
+        x = F.rms_norm(x, (V,))
+        basis = self.fourier_basis
+
+        for step in self.steps:
+            x = step(x, basis)
+
+        x = F.rms_norm(x, (V,))
+        logits = x * self.logit_scale.to(x.dtype)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="mean")
+
+
+# -----------------------------
+# GAUSS MODEL (FFT-based)
+# -----------------------------
+
+class GaussProjection(nn.Module):
+    """Project vocab-space to channels via FFT."""
+    def __init__(self, n_freq, n_channels):
+        super().__init__()
+        self.n_freq = n_freq
+        self.weight = nn.Parameter(torch.randn(n_channels, 2 * n_freq) * 0.02)
+
+    def forward(self, x):
+        X = torch.fft.rfft(x.float(), dim=-1)
+        X = X[..., 1:self.n_freq + 1]
+        X_ri = torch.cat([X.real, X.imag], dim=-1)
+        return (X_ri @ self.weight.T).to(x.dtype)
+
+
+class GaussSynthesis(nn.Module):
+    """Project channels back to vocab-space via IFFT."""
+    def __init__(self, n_freq, n_channels, vocab_size):
+        super().__init__()
+        self.n_freq = n_freq
+        self.vocab_size = vocab_size
+        self.weight = nn.Parameter(torch.randn(2 * n_freq, n_channels) * 0.02)
+
+    def forward(self, h):
+        n, V = self.n_freq, self.vocab_size
+        Y_ri = h.float() @ self.weight
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
+        shape = list(h.shape[:-1]) + [V // 2 + 1]
+        full = torch.zeros(shape, dtype=Y.dtype, device=h.device)
+        full[..., 1:n + 1] = Y
+        return torch.fft.irfft(full, n=V, dim=-1).to(h.dtype)
+
+
+class GaussMemoryStep(nn.Module):
+    """Cross-position mixing via FFT projections + causal decay memory."""
+    def __init__(self, n_freq, n_channels, vocab_size, decay_init=3.0):
+        super().__init__()
+        self.n_channels = n_channels
+        self.q_proj = GaussProjection(n_freq, n_channels)
+        self.k_proj = GaussProjection(n_freq, n_channels)
+        self.v_proj = GaussProjection(n_freq, n_channels)
+        self.o_proj = GaussSynthesis(n_freq, n_channels, vocab_size)
+        self.decay_logit = nn.Parameter(torch.tensor(decay_init))
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        B, T, V = x.shape
+        dtype = x.dtype
+        queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        scores = torch.bmm(queries, keys.transpose(1, 2))
+        decay = torch.sigmoid(self.decay_logit)
+        pos = torch.arange(T, device=x.device)
+        diff = pos.unsqueeze(0) - pos.unsqueeze(1)
+        causal = (diff > 0)
+        weights = (decay ** (diff.float() - 1).clamp(min=0)) * causal
+        scores = scores * weights.to(dtype).unsqueeze(0)
+        retrieved = torch.bmm(scores, values)
+        return self.o_proj(retrieved) * self.out_scale.to(dtype)
+
+
+class GaussRegisterOp(nn.Module):
+    """Within-position transform via FFT → channels → IFFT."""
+    def __init__(self, n_freq, n_channels, vocab_size, activation="gelu"):
+        super().__init__()
+        self.activation = activation
+        self.n_freq = n_freq
+        self.vocab_size = vocab_size
+        s = 0.02
+        self.freq_to_ch = nn.Parameter(torch.randn(n_channels, 2 * n_freq) * s)
+        self.channel_mix = nn.Parameter(torch.randn(n_channels, n_channels) * s)
+        self.bias = nn.Parameter(torch.zeros(n_channels))
+        self.ch_to_freq = nn.Parameter(torch.randn(2 * n_freq, n_channels) * s)
+        self.out_scale = nn.Parameter(torch.tensor(0.1))
+
+    def forward(self, x):
+        B, T, V = x.shape
+        dtype = x.dtype
+        n = self.n_freq
+        X = torch.fft.rfft(x.float(), dim=-1)
+        X = X[..., 1:n + 1]
+        X_ri = torch.cat([X.real, X.imag], dim=-1)
+        h = X_ri @ self.freq_to_ch.T
+        h = h @ self.channel_mix + self.bias
+        h = apply_activation(h, self.activation)
+        Y_ri = h @ self.ch_to_freq.T
+        Y = torch.complex(Y_ri[..., :n].float(), Y_ri[..., n:].float())
+        full = torch.zeros(B, T, V // 2 + 1, dtype=Y.dtype, device=x.device)
+        full[..., 1:n + 1] = Y
+        return torch.fft.irfft(full, n=V, dim=-1).to(dtype) * self.out_scale.to(dtype)
+
+
+class GaussRegisterStep(nn.Module):
+    """One step: FFT memory + FFT register op."""
+    def __init__(self, n_freq, n_channels, vocab_size, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.memory = GaussMemoryStep(n_freq, n_channels, vocab_size, decay_init)
+        self.register_op = GaussRegisterOp(n_freq, n_channels, vocab_size, activation)
+        self.mem_scale = nn.Parameter(torch.ones(1))
+        self.op_scale = nn.Parameter(torch.ones(1))
+
+    def forward(self, x):
+        D = x.size(-1)
+        x = x + self.mem_scale.to(x.dtype) * self.memory(F.rms_norm(x, (D,)))
+        x = x + self.op_scale.to(x.dtype) * self.register_op(F.rms_norm(x, (D,)))
+        return x
+
+
+class GaussRegisterGPT(nn.Module):
+    """Register machine with FFT-based operations. No stored Fourier basis."""
+    def __init__(self, vocab_size, num_steps, n_freq, n_channels,
+                 logit_softcap, activation="gelu", decay_init=3.0):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.num_steps = num_steps
+        self.logit_softcap = logit_softcap
+        self.steps = nn.ModuleList([
+            GaussRegisterStep(n_freq, n_channels, vocab_size, activation, decay_init)
+            for _ in range(num_steps)
+        ])
+        self.logit_scale = nn.Parameter(torch.tensor(1.0))
+
+    def forward(self, input_ids, target_ids):
+        V = self.vocab_size
+        x = F.one_hot(input_ids, V).to(dtype=torch.bfloat16)
+        x = F.rms_norm(x, (V,))
+        for step in self.steps:
+            x = step(x)
+        x = F.rms_norm(x, (V,))
+        logits = x * self.logit_scale.to(x.dtype)
+        logits = self.logit_softcap * torch.tanh(logits / self.logit_softcap)
+        return F.cross_entropy(logits.float().reshape(-1, V), target_ids.reshape(-1), reduction="mean")
+
+
+# -----------------------------
+# V4 MODEL (param-optimized, see model_v4.py for documented implementation)
+# -----------------------------
+
+from v4_param_optimized.model import RegisterGPTv4
+
+
+# -----------------------------
+# TRAINING
+# -----------------------------
+
+def main():
+    code = Path(__file__).read_text(encoding="utf-8")
+    args = Hyperparameters()
+
+    distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
+    rank = int(os.environ.get("RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    grad_accum_steps = args.grad_accum_steps
+    grad_scale = 1.0 / grad_accum_steps
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA required")
+    device = torch.device("cuda", local_rank)
+    torch.cuda.set_device(device)
+    master = rank == 0
+    if distributed:
+        os.environ["NCCL_P2P_DISABLE"] = args.nccl_p2p_disable
+        if master:
+            print(f"[init] NCCL_P2P_DISABLE={args.nccl_p2p_disable}, calling init_process_group")
+        dist.init_process_group(backend="nccl")
+        if master:
+            print("[init] init_process_group done, waiting on barrier")
+        dist.barrier()
+        if master:
+            print("[init] DDP barrier passed")
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+    logfile = None
+    if master:
+        os.makedirs("logs", exist_ok=True)
+        logfile = f"logs/{args.run_id}.txt"
+        print(logfile)
+
+    def log0(msg, console=True):
+        if not master: return
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        if console: print(line)
+        if logfile:
+            with open(logfile, "a") as f: print(line, file=f)
+
+    log0(code, console=False)
+    log0(f"[init] rank={rank} world_size={world_size} device={device} model_version={args.model_version}")
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+
+    log0(f"[init] loading tokenizer from {args.tokenizer_path}")
+    sp = spm.SentencePieceProcessor(model_file=args.tokenizer_path)
+    if int(sp.vocab_size()) != args.vocab_size:
+        raise ValueError(f"VOCAB_SIZE mismatch: tokenizer has {sp.vocab_size()}, expected {args.vocab_size}")
+    log0(f"[init] loading validation data from {args.val_files}")
+    val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
+    bbl, hsl, ibl = build_sentencepiece_luts(sp, args.vocab_size, device)
+    log0(f"[init] data loaded: {val_tokens.numel()} val tokens")
+
+    if args.model_version == "v1":
+        from v1_shared_attention.model import RegisterGPT as RegisterGPTv1
+        base_model = RegisterGPTv1(
+            vocab_size=args.vocab_size,
+            num_heads=args.num_heads,
+            num_kv_heads=args.num_kv_heads,
+            num_steps=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            rope_base=args.rope_base,
+            qk_gain_init=args.qk_gain_init,
+            activation=args.activation,
+        ).to(device).bfloat16()
+    elif args.model_version == "v2":
+        from v2_causal_conv.model import RegisterGPT as RegisterGPTv2
+        base_model = RegisterGPTv2(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            kernel_size=args.kernel_size,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+        ).to(device).bfloat16()
+    elif args.model_version == "wave":
+        from v6_brain_wave.model import BrainWaveGPT
+        band_split = tuple(int(x) for x in args.band_split.split(","))
+        base_model = BrainWaveGPT(
+            vocab_size=args.vocab_size,
+            num_cycles=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            slow_decay_init=args.slow_decay_init,
+            fast_decay_init=args.fast_decay_init,
+            band_split=band_split,
+        ).to(device).bfloat16()
+    elif args.model_version == "v4":
+        base_model = RegisterGPTv4(
+            vocab_size=args.vocab_size,
+            unique_steps=args.unique_steps,
+            invocations_per_step=args.invocations_per_step,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            n_heads=args.n_heads,
+            transform_rank=args.transform_rank,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "gauss":
+        n_freq = args.n_fourier_basis
+        base_model = GaussRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            n_freq=n_freq,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "lgp":
+        from v7_lgp.model import LGPGPT
+        base_model = LGPGPT(
+            vocab_size=args.vocab_size,
+            num_instructions=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            n_ops=args.n_ops,
+            logit_softcap=args.logit_softcap,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "graph":
+        from v8_word_graph.model import WordGraphGPT
+        base_model = WordGraphGPT(
+            vocab_size=args.vocab_size,
+            num_hops=args.num_steps,
+            interaction_rank=args.interaction_rank,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "policy":
+        from v10_policy.model import PolicyGPT
+        base_model = PolicyGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            n_ops=args.n_ops,
+            logit_softcap=args.logit_softcap,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "brainwave":
+        from v11_brainwave.model import BrainWaveGPT as BrainWaveGPTv11
+        base_model = BrainWaveGPTv11(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            gate_dim=args.state_dim,
+            logit_softcap=args.logit_softcap,
+        ).to(device).bfloat16()
+    elif args.model_version == "meta":
+        from v9_meta_state.model import MetaStateGPT
+        base_model = MetaStateGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+    elif args.model_version == "sparse":
+        from v12_sparse_register.model import SparseRegisterGPT
+        base_model = SparseRegisterGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            k_active=args.k_active,
+            inner_mul=args.inner_mul,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+            parallel_waves=args.parallel_waves,
+            grad_checkpoint=args.grad_checkpoint,
+        ).to(device).bfloat16()
+    elif args.model_version == "tpg":
+        from v11_tpg.model import TPGGPT
+        base_model = TPGGPT(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            state_dim=args.state_dim,
+            inner_dim=args.inner_dim,
+            logit_softcap=args.logit_softcap,
+            tau=args.gumbel_tau,
+            halt_threshold=args.halt_threshold,
+            ponder_lambda=args.ponder_lambda,
+        ).to(device).bfloat16()
+    else:
+        base_model = AssocRegisterLM(
+            vocab_size=args.vocab_size,
+            num_steps=args.num_steps,
+            n_fourier_basis=args.n_fourier_basis,
+            n_channels=args.n_channels,
+            logit_softcap=args.logit_softcap,
+            activation=args.activation,
+            decay_init=args.decay_init,
+        ).to(device).bfloat16()
+
+    # Keep small control params in fp32
+    with torch.no_grad():
+        for name, p in base_model.named_parameters():
+            if (p.ndim < 2 or any(pat in name for pat in CONTROL_TENSOR_NAME_PATTERNS)) and p.dtype != torch.float32:
+                p.data = p.data.float()
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    log0(f"[init] model built: {n_params/1e3:.0f}K params on {device}")
+
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if args.torch_compile else base_model
+    if distributed:
+        dist.barrier()
+    log0(f"[init] wrapping with DDP (distributed={distributed})")
+    model = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    log0(f"[init] DDP ready")
+
+    optimizer = torch.optim.Adam(
+        base_model.parameters(),
+        lr=args.lr,
+        betas=(args.beta1, args.beta2),
+        eps=args.adam_eps,
+        weight_decay=args.weight_decay,
+        fused=True,
+    )
+    for g in optimizer.param_groups:
+        g["base_lr"] = args.lr
+
+    n_params = sum(p.numel() for p in base_model.parameters())
+    n_trainable = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    raw_bytes = sum(p.numel() * p.element_size() for p in base_model.parameters())
+    est_int8_bytes = sum(p.numel() for p in base_model.parameters())  # ~1 byte per param
+    log0(f"run_id:{args.run_id}")
+    log0(f"model_version:{args.model_version}")
+    log0(f"model_params:{n_params} trainable:{n_trainable} vocab=dim={args.vocab_size} raw:{raw_bytes/1e6:.1f}MB est_int8:{est_int8_bytes/1e6:.1f}MB")
+    if args.model_version == "wave":
+        log0(f"architecture:BrainWaveGPT (oscillatory dynamics, cross-frequency coupling)")
+        log0(f"cycles:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis} bands:{args.band_split}")
+        log0(f"slow_decay_init:{args.slow_decay_init} fast_decay_init:{args.fast_decay_init}")
+    elif args.model_version == "v4":
+        log0(f"unique_steps:{args.unique_steps} invocations:{args.invocations_per_step} depth:{args.unique_steps * args.invocations_per_step}")
+        log0(f"channels:{args.n_channels} heads:{args.n_heads} rank:{args.transform_rank} fourier:{args.n_fourier_basis}")
+    else:
+        log0(f"steps:{args.num_steps} channels:{args.n_channels} fourier:{args.n_fourier_basis}")
+    log0(f"activation:{args.activation} lr:{args.lr} grad_clip:{args.grad_clip_norm} decay_init:{args.decay_init}")
+    log0(f"NO attention. NO embedding. NO output projection.")
+    log0(f"world_size:{world_size} grad_accum:{grad_accum_steps} batch:{args.train_batch_tokens}")
+
+    log0(f"[init] loading training data from {args.train_files}")
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    max_wc_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds else None
+
+    def lr_mul(step, elapsed_ms):
+        if args.warmdown_iters <= 0:
+            return 1.0
+        if max_wc_ms is None:
+            ws = max(args.iterations - args.warmdown_iters, 0)
+            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if ws <= step < args.iterations else 1.0
+        sms = elapsed_ms / max(step, 1)
+        wms = args.warmdown_iters * sms
+        rms = max(max_wc_ms - elapsed_ms, 0.0)
+        return rms / max(wms, 1e-9) if rms <= wms else 1.0
+
+    # Resume from checkpoint if provided
+    start_step = 0
+    if args.resume_from and Path(args.resume_from).exists():
+        ckpt = torch.load(args.resume_from, map_location=device, weights_only=False)
+        if "model" in ckpt and "step" in ckpt:
+            # Full checkpoint (model + optimizer + step)
+            base_model.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            start_step = ckpt["step"]
+            log0(f"resumed checkpoint from {args.resume_from} at step {start_step}")
+        else:
+            # Plain state dict (weights only)
+            base_model.load_state_dict(ckpt, strict=False)
+            log0(f"loaded weights from {args.resume_from} (no optimizer/step, restarting from 0)")
+
+    def save_checkpoint(step):
+        if not master:
+            return
+        ckpt_path = f"logs/{args.run_id}_ckpt.pt"
+        torch.save({
+            "model": base_model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+        }, ckpt_path)
+        log0(f"checkpoint:{ckpt_path} step:{step}")
+
+    # Warmup (skip if resuming)
+    log0(f"[init] starting warmup ({args.warmup_steps} steps)")
+    if start_step == 0:
+        for ws in range(args.warmup_steps):
+            optimizer.zero_grad(set_to_none=True)
+            for _ in range(grad_accum_steps):
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                    loss = model(x, y)
+                (loss * grad_scale).backward()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            optimizer.step()
+            torch.cuda.synchronize()
+            if master and (ws + 1) % 10 == 0 or ws + 1 == args.warmup_steps:
+                log0(f"warmup:{ws + 1}/{args.warmup_steps}")
+
+    train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    # Training
+    train_ms = 0.0
+    stop_after = None
+    t0 = time.perf_counter()
+    step = start_step
+    while True:
+        last = step == args.iterations or (stop_after is not None and step >= stop_after)
+        if last or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
+            train_ms += 1000.0 * (time.perf_counter() - t0)
+            vl, vbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"step:{step}/{args.iterations} val_loss:{vl:.4f} val_bpb:{vbpb:.4f} train_time:{train_ms:.0f}ms")
+            t0 = time.perf_counter()
+        if last:
+            if stop_after is not None and step < args.iterations:
+                log0(f"stopping_early: step:{step}/{args.iterations}")
+            break
+
+        lm = lr_mul(step, train_ms + 1000.0 * (time.perf_counter() - t0))
+        for g in optimizer.param_groups:
+            g["lr"] = g["base_lr"] * lm
+
+        step_t0 = time.perf_counter()
+        optimizer.zero_grad(set_to_none=True)
+        train_loss_accum = 0.0
+        for _ in range(grad_accum_steps):
+            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(x, y)
+            (loss * grad_scale).backward()
+            train_loss_accum += loss.item() * grad_scale
+
+        if args.grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        optimizer.step()
+        torch.cuda.synchronize()
+
+        step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        approx_ms = train_ms + 1000.0 * (time.perf_counter() - t0)
+        step += 1
+        if master and args.train_log_every > 0 and (step <= 10 or step % args.train_log_every == 0):
+            log0(f"step:{step}/{args.iterations} train_loss:{train_loss_accum:.4f} time:{approx_ms:.0f}ms avg:{approx_ms / step:.1f}ms tok/s:{args.train_batch_tokens / (step_ms / 1000):.0f}")
+        if max_wc_ms and stop_after is None and approx_ms >= max_wc_ms:
+            stop_after = step
+        if args.checkpoint_every > 0 and step % args.checkpoint_every == 0:
+            save_checkpoint(step)
+
+    # Final checkpoint
+    save_checkpoint(step)
+
+    # Serialize
+    if master:
+        sd = {k: v for k, v in base_model.state_dict().items()}
+        out = f"logs/{args.run_id}_model.pt"
+        torch.save(sd, out)
+        log0(f"saved:{out} bytes:{Path(out).stat().st_size}")
+
+        qobj, qstats = quantize_state_dict_int8(sd)
+        buf = io.BytesIO()
+        torch.save(qobj, buf)
+        compressed = zlib.compress(buf.getvalue(), 9)
+        qpath = f"logs/{args.run_id}_model.int8.ptz"
+        Path(qpath).write_bytes(compressed)
+        log0(f"quantized:{qpath} bytes:{len(compressed)} ratio:{qstats['baseline_tensor_bytes'] / max(qstats['int8_payload_bytes'], 1):.2f}x")
+
+        if args.roundtrip_eval:
+            dq = dequantize_state_dict_int8(torch.load(io.BytesIO(zlib.decompress(Path(qpath).read_bytes())), weights_only=False))
+            base_model.load_state_dict(dq, strict=False)
+            qvl, qvbpb = eval_val(args, model, rank, world_size, device, grad_accum_steps, val_tokens, bbl, hsl, ibl)
+            log0(f"final_int8_zlib_roundtrip val_loss:{qvl:.4f} val_bpb:{qvbpb:.4f}")
+
+        # Write manifest
+        import json as _json
+        manifest = {
+            "run_id": args.run_id,
+            "model_version": args.model_version,
+            "params": n_params,
+            "trainable": n_trainable,
+            "raw_bytes": raw_bytes,
+            "est_int8_bytes": est_int8_bytes,
+            "quantized_bytes": len(compressed),
+            "vocab_size": args.vocab_size,
+            "num_steps": args.num_steps,
+            "n_channels": getattr(args, "n_channels", None),
+            "n_fourier_basis": getattr(args, "n_fourier_basis", None),
+            "state_dim": getattr(args, "state_dim", None),
+            "inner_dim": getattr(args, "inner_dim", None),
+            "n_ops": getattr(args, "n_ops", None),
+            "lr": args.lr,
+            "activation": args.activation,
+            "decay_init": args.decay_init,
+            "steps_trained": step,
+            "final_train_loss": train_loss_accum if step > start_step else None,
+            "val_loss": vl,
+            "val_bpb": vbpb,
+            "train_time_ms": train_ms,
+            "world_size": world_size,
+            "grad_accum_steps": grad_accum_steps,
+            "batch_tokens": args.train_batch_tokens,
+            "model_path": out,
+            "quantized_path": qpath,
+        }
+        manifest_path = f"logs/{args.run_id}_manifest.json"
+        with open(manifest_path, "w") as f:
+            _json.dump(manifest, f, indent=2)
+        log0(f"manifest:{manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
+
+[21:06:07] [init] rank=0 world_size=3 device=cuda:0 model_version=meta
+[21:06:07] [init] loading tokenizer from ./data/tokenizers/fineweb_1024_bpe.model
+[21:06:07] [init] loading validation data from ./data/datasets/fineweb10B_sp1024/fineweb_val_*.bin
+[21:06:07] [init] data loaded: 62021633 val tokens
+[21:06:07] [init] model built: 4195K params on cuda:0
+[21:06:07] [init] wrapping with DDP (distributed=True)
+[21:06:08] [init] DDP ready
+[21:06:08] run_id:meta_3gpu
+[21:06:08] model_version:meta
+[21:06:08] model_params:4195369 trainable:4195369 vocab=dim=1024 raw:16.8MB est_int8:4.2MB
+[21:06:08] steps:8 channels:128 fourier:16
+[21:06:08] activation:gelu lr:0.03 grad_clip:1.0 decay_init:3.0
+[21:06:08] NO attention. NO embedding. NO output projection.
+[21:06:08] world_size:3 grad_accum:16 batch:491520
+[21:06:08] [init] loading training data from ./data/datasets/fineweb10B_sp1024/fineweb_train_*.bin
+[21:06:09] [init] starting warmup (20 steps)
+[21:06:25] warmup:10/20
+[21:06:40] warmup:20/20
+[21:07:41] step:0/500 val_loss:6.5790 val_bpb:3.8964 train_time:0ms
+[21:07:43] step:1/500 train_loss:6.5753 time:1550ms avg:1550.3ms tok/s:317068
+[21:07:44] step:2/500 train_loss:6.5732 time:3123ms avg:1561.5ms tok/s:316563
+[21:07:46] step:3/500 train_loss:6.5928 time:4679ms avg:1559.8ms tok/s:316642
+[21:07:48] step:4/500 train_loss:6.5728 time:6239ms avg:1559.7ms tok/s:316152
+[21:07:49] step:5/500 train_loss:6.5844 time:7799ms avg:1559.8ms tok/s:315849
+[21:07:51] step:6/500 train_loss:6.5901 time:9358ms avg:1559.7ms tok/s:316103
+[21:07:52] step:7/500 train_loss:6.5731 time:10927ms avg:1561.0ms tok/s:315752
+[21:07:54] step:8/500 train_loss:6.5725 time:12482ms avg:1560.3ms tok/s:316661
+[21:07:55] step:9/500 train_loss:6.5653 time:14040ms avg:1560.1ms tok/s:316223
+[21:07:57] step:10/500 train_loss:6.5865 time:15600ms avg:1560.0ms tok/s:316156
+[21:08:12] step:20/500 train_loss:6.5606 time:31125ms avg:1556.2ms tok/s:317182
+[21:08:28] step:30/500 train_loss:6.5446 time:46639ms avg:1554.6ms tok/s:316206
+[21:08:44] step:40/500 train_loss:6.5838 time:62173ms avg:1554.3ms tok/s:317544
+[21:08:59] step:50/500 train_loss:6.5533 time:77716ms avg:1554.3ms tok/s:316707
+[21:09:15] step:60/500 train_loss:6.5484 time:93230ms avg:1553.8ms tok/s:315888
+[21:09:30] step:70/500 train_loss:6.5293 time:108754ms avg:1553.6ms tok/s:316325
+[21:09:46] step:80/500 train_loss:6.5540 time:124273ms avg:1553.4ms tok/s:317066
+[21:10:01] step:90/500 train_loss:6.5506 time:139755ms avg:1552.8ms tok/s:317373
+[21:10:17] step:100/500 train_loss:6.5471 time:155282ms avg:1552.8ms tok/s:317348
+[21:10:32] step:110/500 train_loss:6.5749 time:170782ms avg:1552.6ms tok/s:316419
+[21:10:48] step:120/500 train_loss:6.5384 time:186335ms avg:1552.8ms tok/s:315424
+[21:11:03] step:130/500 train_loss:6.5347 time:201868ms avg:1552.8ms tok/s:316723
+[21:11:19] step:140/500 train_loss:6.5413 time:217381ms avg:1552.7ms tok/s:316854
+[21:11:34] step:150/500 train_loss:6.5500 time:232898ms avg:1552.7ms tok/s:316714
+[21:11:50] step:160/500 train_loss:6.5592 time:248406ms avg:1552.5ms tok/s:317155
+[21:12:05] step:170/500 train_loss:6.5500 time:263931ms avg:1552.5ms tok/s:316352
+[21:12:21] step:180/500 train_loss:6.5558 time:279423ms avg:1552.4ms tok/s:317656
+[21:12:36] step:190/500 train_loss:6.5613 time:294924ms avg:1552.2ms tok/s:317127
+[21:12:52] step:200/500 train_loss:6.5387 time:310404ms avg:1552.0ms tok/s:317799
+[21:13:10] step:210/500 train_loss:6.5455 time:328443ms avg:1564.0ms tok/s:317093
+[21:13:25] step:220/500 train_loss:6.5607 time:343929ms avg:1563.3ms tok/s:317651
+[21:13:41] step:230/500 train_loss:6.5557 time:359417ms avg:1562.7ms tok/s:317250
+[21:13:56] step:240/500 train_loss:6.5548 time:374903ms avg:1562.1ms tok/s:317494
+[21:14:12] step:250/500 train_loss:6.5688 time:390392ms avg:1561.6ms tok/s:317359
+[21:14:27] step:260/500 train_loss:6.5603 time:405870ms avg:1561.0ms tok/s:317281
+[21:14:43] step:270/500 train_loss:6.5416 time:421355ms avg:1560.6ms tok/s:316872
+[21:14:58] step:280/500 train_loss:6.5472 time:436847ms avg:1560.2ms tok/s:317231
+[21:15:14] step:290/500 train_loss:6.5789 time:452331ms avg:1559.8ms tok/s:317844
+[21:15:29] step:300/500 train_loss:6.5608 time:467812ms avg:1559.4ms tok/s:317402
+[21:15:45] step:310/500 train_loss:6.5532 time:483303ms avg:1559.0ms tok/s:316962
+[21:16:00] step:320/500 train_loss:6.5642 time:498851ms avg:1558.9ms tok/s:317335
+[21:16:16] step:330/500 train_loss:6.5684 time:514344ms avg:1558.6ms tok/s:316849
+[21:16:31] step:340/500 train_loss:6.5723 time:529828ms avg:1558.3ms tok/s:317292
+[21:16:47] step:350/500 train_loss:6.5402 time:545315ms avg:1558.0ms tok/s:317859
+[21:17:02] step:360/500 train_loss:6.5469 time:560792ms avg:1557.8ms tok/s:317911
+[21:17:18] step:370/500 train_loss:6.5588 time:576275ms avg:1557.5ms tok/s:317639
+[21:17:33] step:380/500 train_loss:6.5593 time:591748ms avg:1557.2ms tok/s:318118
+[21:17:49] step:390/500 train_loss:6.5666 time:607233ms avg:1557.0ms tok/s:317556
+[21:18:04] step:400/500 train_loss:6.5440 time:622720ms avg:1556.8ms tok/s:317632
+[21:18:22] step:410/500 train_loss:6.5459 time:640429ms avg:1562.0ms tok/s:317169
+[21:18:37] step:420/500 train_loss:6.5701 time:655913ms avg:1561.7ms tok/s:317446
+[21:18:53] step:430/500 train_loss:6.5596 time:671396ms avg:1561.4ms tok/s:318035
+[21:19:08] step:440/500 train_loss:6.5415 time:686870ms avg:1561.1ms tok/s:318068
+[21:19:24] step:450/500 train_loss:6.5711 time:702351ms avg:1560.8ms tok/s:317771
+[21:19:39] step:460/500 train_loss:6.5644 time:717832ms avg:1560.5ms tok/s:317621
+[21:19:55] step:470/500 train_loss:6.5442 time:733342ms avg:1560.3ms tok/s:316600
+[21:20:10] step:480/500 train_loss:6.5432 time:748933ms avg:1560.3ms tok/s:316805
+[21:20:26] step:490/500 train_loss:6.5409 time:764420ms avg:1560.0ms tok/s:317617
+[21:20:41] step:500/500 train_loss:6.5359 time:779905ms avg:1559.8ms tok/s:318011
+[21:20:42] checkpoint:logs/meta_3gpu_ckpt.pt step:500
+[21:21:43] step:500/500 val_loss:6.5530 val_bpb:3.8811 train_time:780256ms
+[21:21:43] checkpoint:logs/meta_3gpu_ckpt.pt step:500
+[21:21:43] saved:logs/meta_3gpu_model.pt bytes:16812315
+[21:21:44] quantized:logs/meta_3gpu_model.int8.ptz bytes:9367297 ratio:1.60x
+[21:21:44] manifest:logs/meta_3gpu_manifest.json
