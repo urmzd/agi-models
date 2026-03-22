@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch.nn as nn
 
-from core.registry import REGISTRY, build_model
+from core.registry import get_registry, build_model
 
 # Small args for fast instantiation on CPU
 _SMALL_ARGS = SimpleNamespace(
@@ -31,7 +31,7 @@ _SMALL_ARGS = SimpleNamespace(
 )
 
 
-@pytest.mark.parametrize("version", list(REGISTRY.keys()))
+@pytest.mark.parametrize("version", list(get_registry().keys()))
 def test_registry_import(version):
     """Every REGISTRY key imports and instantiates successfully."""
     model = build_model(version, _SMALL_ARGS)

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from core.registry import REGISTRY, build_model
+from core.registry import get_registry, build_model
 
 _SMALL_ARGS = SimpleNamespace(
     vocab_size=32, num_steps=2,
@@ -22,7 +22,7 @@ _SMALL_ARGS = SimpleNamespace(
 BATCH, SEQ = 2, 4
 
 
-@pytest.mark.parametrize("version", list(REGISTRY.keys()))
+@pytest.mark.parametrize("version", list(get_registry().keys()))
 def test_forward_returns_scalar_loss(version):
     """Each model forward(input_ids, target_ids) returns a scalar loss."""
     model = build_model(version, _SMALL_ARGS).float()
@@ -36,7 +36,7 @@ def test_forward_returns_scalar_loss(version):
     assert torch.isfinite(loss), "Loss should be finite"
 
 
-@pytest.mark.parametrize("version", list(REGISTRY.keys()))
+@pytest.mark.parametrize("version", list(get_registry().keys()))
 def test_backward(version):
     """Each model supports backward pass."""
     model = build_model(version, _SMALL_ARGS).float()
